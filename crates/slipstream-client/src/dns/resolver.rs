@@ -8,18 +8,38 @@ use tracing::warn;
 
 use super::debug::DebugMetrics;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolverHealthState {
+    Active,
+    Probe,
+    Cooldown,
+    Retiring,
+    Disabled,
+}
+
 pub(crate) struct ResolverState {
     pub(crate) addr: SocketAddr,
     pub(crate) storage: libc::sockaddr_storage,
     pub(crate) local_addr_storage: Option<libc::sockaddr_storage>,
     pub(crate) mode: ResolverMode,
+    pub(crate) state: ResolverHealthState,
     pub(crate) added: bool,
+    pub(crate) retire_pending: bool,
     pub(crate) path_id: libc::c_int,
     pub(crate) unique_path_id: Option<u64>,
     pub(crate) probe_attempts: u32,
+    pub(crate) failure_streak: u32,
     pub(crate) next_probe_at: u64,
     pub(crate) last_probe_reason_code: i32,
     pub(crate) last_probe_reason_repeats: u32,
+    pub(crate) activated_at: u64,
+    pub(crate) last_success_at: u64,
+    pub(crate) last_failure_at: u64,
+    pub(crate) success_rate_ewma: f64,
+    pub(crate) throughput_ewma: f64,
+    pub(crate) rtt_ewma: f64,
+    pub(crate) loss_ewma: f64,
+    pub(crate) score_ewma: f64,
     pub(crate) pending_polls: usize,
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
@@ -35,9 +55,35 @@ pub(crate) struct ResolverState {
 impl ResolverState {
     pub(crate) fn label(&self) -> String {
         format!(
-            "path_id={} unique_id={:?} resolver={} mode={:?}",
-            self.path_id, self.unique_path_id, self.addr, self.mode
+            "path_id={} unique_id={:?} resolver={} mode={:?} state={:?} retire_pending={}",
+            self.path_id,
+            self.unique_path_id,
+            self.addr,
+            self.mode,
+            self.state,
+            self.retire_pending
         )
+    }
+
+    pub(crate) fn is_path_occupied(&self) -> bool {
+        self.added || self.retire_pending
+    }
+
+    pub(crate) fn is_probe_due(&self, now: u64) -> bool {
+        if self.is_path_occupied() || self.next_probe_at > now {
+            return false;
+        }
+        matches!(
+            self.state,
+            ResolverHealthState::Probe | ResolverHealthState::Cooldown
+        )
+    }
+
+    pub(crate) fn is_schedulable(&self, now: u64) -> bool {
+        self.path_id >= 0
+            && !self.retire_pending
+            && self.cooldown_until <= now
+            && matches!(self.state, ResolverHealthState::Active)
     }
 }
 
@@ -65,13 +111,28 @@ pub(crate) fn resolve_resolvers(
             storage: socket_addr_to_storage(addr),
             local_addr_storage: None,
             mode: resolver.mode,
+            state: if is_primary {
+                ResolverHealthState::Active
+            } else {
+                ResolverHealthState::Probe
+            },
             added: is_primary,
+            retire_pending: false,
             path_id: if is_primary { 0 } else { -1 },
             unique_path_id: if is_primary { Some(0) } else { None },
             probe_attempts: 0,
+            failure_streak: 0,
             next_probe_at: 0,
             last_probe_reason_code: i32::MIN,
             last_probe_reason_repeats: 0,
+            activated_at: if is_primary { 1 } else { 0 },
+            last_success_at: 0,
+            last_failure_at: 0,
+            success_rate_ewma: if is_primary { 0.9 } else { 0.5 },
+            throughput_ewma: 0.0,
+            rtt_ewma: 100_000.0,
+            loss_ewma: 0.0,
+            score_ewma: if is_primary { 1.5 } else { 1.0 },
             pending_polls: 0,
             inflight_poll_ids: HashMap::new(),
             pacing_budget: match resolver.mode {
@@ -95,7 +156,9 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
         "Path for resolver {} became unavailable; resetting state",
         resolver.addr
     );
+    let disabled = matches!(resolver.state, ResolverHealthState::Disabled);
     resolver.added = false;
+    resolver.retire_pending = false;
     resolver.path_id = -1;
     resolver.unique_path_id = None;
     resolver.local_addr_storage = None;
@@ -109,8 +172,14 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.last_quality_eval_at = 0;
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
+    resolver.activated_at = 0;
     resolver.last_probe_reason_code = i32::MIN;
     resolver.last_probe_reason_repeats = 0;
+    resolver.state = if disabled {
+        ResolverHealthState::Disabled
+    } else {
+        ResolverHealthState::Probe
+    };
 }
 
 pub(crate) fn sockaddr_storage_to_socket_addr(

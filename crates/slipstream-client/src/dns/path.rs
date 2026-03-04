@@ -6,9 +6,11 @@ use slipstream_ffi::picoquic::{
     slipstream_path_probe_debug_t, slipstream_set_default_path_mode,
 };
 use slipstream_ffi::ResolverMode;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use tracing::{debug, info, warn};
 
-use super::resolver::{reset_resolver_path, ResolverState};
+use super::resolver::{reset_resolver_path, ResolverHealthState, ResolverState};
 
 const PATH_PROBE_INITIAL_DELAY_US: u64 = 250_000;
 const PATH_PROBE_MAX_DELAY_US: u64 = 10_000_000;
@@ -34,6 +36,20 @@ pub(crate) fn refresh_resolver_path(
     cnx: *mut picoquic_cnx_t,
     resolver: &mut ResolverState,
 ) -> bool {
+    if resolver.retire_pending {
+        if let Some(unique_path_id) = resolver.unique_path_id {
+            let path_id = unsafe { slipstream_get_path_id_from_unique(cnx, unique_path_id) };
+            if path_id >= 0 {
+                resolver.added = true;
+                if resolver.path_id != path_id {
+                    resolver.path_id = path_id;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
     if let Some(unique_path_id) = resolver.unique_path_id {
         let path_id = unsafe { slipstream_get_path_id_from_unique(cnx, unique_path_id) };
         if path_id >= 0 {
@@ -41,6 +57,7 @@ pub(crate) fn refresh_resolver_path(
             if resolver.path_id != path_id {
                 resolver.path_id = path_id;
             }
+            resolver.state = ResolverHealthState::Active;
             return true;
         }
         resolver.unique_path_id = None;
@@ -50,11 +67,16 @@ pub(crate) fn refresh_resolver_path(
     if path_id < 0 {
         if resolver.added || resolver.path_id >= 0 {
             reset_resolver_path(resolver);
+            resolver.next_probe_at = 0;
         }
         return false;
     }
 
     resolver.added = true;
+    resolver.state = ResolverHealthState::Active;
+    if resolver.activated_at == 0 {
+        resolver.activated_at = unsafe { picoquic_current_time() };
+    }
     if resolver.path_id != path_id {
         resolver.path_id = path_id;
     }
@@ -78,16 +100,25 @@ pub(crate) fn add_paths(
     let primary_mode = resolvers[0].mode;
     let mut default_mode = primary_mode;
     let path_target_limit = (unsafe { slipstream_get_path_target_limit() } as usize).max(1);
-    let mut active_paths = resolvers.iter().filter(|resolver| resolver.added).count();
+    let mut active_paths = resolvers
+        .iter()
+        .filter(|resolver| resolver.is_path_occupied())
+        .count();
 
     for resolver in resolvers.iter_mut().skip(1) {
         if active_paths >= path_target_limit {
             break;
         }
-        if resolver.added {
+        if resolver.is_path_occupied() {
             continue;
         }
-        if resolver.next_probe_at > now {
+        if matches!(
+            resolver.state,
+            ResolverHealthState::Disabled | ResolverHealthState::Retiring
+        ) {
+            continue;
+        }
+        if !resolver.is_probe_due(now) {
             continue;
         }
         if resolver.mode != default_mode {
@@ -108,7 +139,14 @@ pub(crate) fn add_paths(
         };
         if ret == 0 && path_id >= 0 {
             resolver.added = true;
+            resolver.retire_pending = false;
+            resolver.state = ResolverHealthState::Active;
             resolver.path_id = path_id;
+            resolver.activated_at = now;
+            resolver.last_success_at = now;
+            resolver.success_rate_ewma = (resolver.success_rate_ewma * 0.8) + 0.2;
+            resolver.failure_streak = 0;
+            resolver.next_probe_at = 0;
             active_paths = active_paths.saturating_add(1);
             resolver.last_probe_reason_code = i32::MIN;
             resolver.last_probe_reason_repeats = 0;
@@ -119,6 +157,10 @@ pub(crate) fn add_paths(
             continue;
         }
         resolver.probe_attempts = resolver.probe_attempts.saturating_add(1);
+        resolver.failure_streak = resolver.failure_streak.saturating_add(1);
+        resolver.last_failure_at = now;
+        resolver.state = ResolverHealthState::Cooldown;
+        resolver.success_rate_ewma *= 0.9;
         let mut probe_debug = slipstream_path_probe_debug_t::default();
         let _ = unsafe {
             slipstream_get_path_probe_debug(
@@ -136,7 +178,7 @@ pub(crate) fn add_paths(
             resolver.last_probe_reason_repeats =
                 resolver.last_probe_reason_repeats.saturating_add(1);
         }
-        let delay = path_probe_backoff(resolver.probe_attempts);
+        let delay = path_probe_backoff(resolver.failure_streak, resolver.addr);
         resolver.next_probe_at = now.saturating_add(delay);
         let level_warn =
             should_warn_probe_failure(reason_changed, resolver.last_probe_reason_repeats);
@@ -191,8 +233,24 @@ pub(crate) fn resolver_mode_to_c(mode: ResolverMode) -> libc::c_int {
     }
 }
 
-fn path_probe_backoff(attempts: u32) -> u64 {
-    let shift = attempts.saturating_sub(1).min(6);
+fn path_probe_backoff(attempts: u32, addr: std::net::SocketAddr) -> u64 {
+    let shift = attempts.saturating_sub(1).min(8);
     let delay = PATH_PROBE_INITIAL_DELAY_US.saturating_mul(1u64 << shift);
-    delay.min(PATH_PROBE_MAX_DELAY_US)
+    apply_probe_jitter(delay.min(PATH_PROBE_MAX_DELAY_US), addr, attempts)
+}
+
+fn apply_probe_jitter(delay: u64, addr: std::net::SocketAddr, attempts: u32) -> u64 {
+    if delay == 0 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    addr.hash(&mut hasher);
+    attempts.hash(&mut hasher);
+    let jitter_window = (delay / 5).max(1);
+    let span = jitter_window.saturating_mul(2).saturating_add(1);
+    let jitter = hasher.finish() % span;
+    delay
+        .saturating_sub(jitter_window)
+        .saturating_add(jitter)
+        .min(PATH_PROBE_MAX_DELAY_US)
 }

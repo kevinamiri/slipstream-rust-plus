@@ -7,7 +7,7 @@ use slipstream_ffi::picoquic::{
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode};
 use std::net::SocketAddr;
 
-use super::resolver::ResolverState;
+use super::resolver::{ResolverHealthState, ResolverState};
 use slipstream_core::normalize_dual_stack_addr;
 
 const MAX_POLL_BURST: usize = PICOQUIC_PACKET_LOOP_RECV_MAX;
@@ -66,10 +66,16 @@ pub(crate) fn handle_dns_response(
             find_resolver_by_addr(ctx.resolvers, peer)
         };
         if let Some(resolver) = resolver {
-            if first_path >= 0 && resolver.path_id != first_path {
+            if first_path >= 0 && !resolver.retire_pending && resolver.path_id != first_path {
                 resolver.path_id = first_path;
                 resolver.added = true;
+                resolver.state = ResolverHealthState::Active;
+                if resolver.activated_at == 0 {
+                    resolver.activated_at = current_time;
+                }
             }
+            resolver.last_success_at = current_time;
+            resolver.success_rate_ewma = (resolver.success_rate_ewma * 0.8) + 0.2;
             resolver.debug.dns_responses = resolver.debug.dns_responses.saturating_add(1);
             if let Some(response_id) = response_id {
                 if resolver.mode == ResolverMode::Authoritative {

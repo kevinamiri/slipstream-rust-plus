@@ -266,7 +266,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 retire_underperforming_path_if_needed(cnx, &mut resolvers, current_time);
                 add_paths(cnx, &mut resolvers)?;
                 for resolver in resolvers.iter_mut() {
-                    if resolver.added {
+                    if resolver.added && !resolver.retire_pending {
                         apply_path_mode(cnx, resolver)?;
                     }
                 }
@@ -286,6 +286,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let mut has_work = streams_len_for_sleep > 0;
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
+                    continue;
+                }
+                if resolver.retire_pending {
                     continue;
                 }
                 let pending_for_sleep = match resolver.mode {
@@ -382,7 +385,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     break;
                 }
                 for resolver in resolvers.iter_mut() {
-                    if resolver.path_id < 0 || resolver.cooldown_until > current_time {
+                    if !resolver.is_schedulable(current_time) {
                         continue;
                     }
                     let weight = path_scheduler_weight(cnx, resolver);
@@ -393,7 +396,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let mut candidate_indices: Vec<usize> = (0..resolver_count)
                     .filter(|idx| {
                         let resolver = &resolvers[*idx];
-                        resolver.path_id >= 0 && resolver.cooldown_until <= current_time
+                        resolver.is_schedulable(current_time)
                     })
                     .collect();
                 if candidate_indices.is_empty() {
@@ -469,7 +472,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) } != 0;
                         if flow_blocked {
                             for resolver in resolvers.iter_mut() {
-                                if resolver.mode == ResolverMode::Recursive && resolver.added {
+                                if resolver.mode == ResolverMode::Recursive
+                                    && resolver.added
+                                    && !resolver.retire_pending
+                                {
                                     resolver.pending_polls = resolver.pending_polls.max(1);
                                 }
                             }
@@ -569,6 +575,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
+                if resolver.retire_pending {
+                    continue;
+                }
                 match resolver.mode {
                     ResolverMode::Authoritative => {
                         let quality = fetch_path_quality(cnx, resolver);
@@ -659,6 +668,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 resolver.debug.zero_send_loops = zero_send_loops;
                 resolver.debug.zero_send_with_streams = zero_send_with_streams;
                 if !refresh_resolver_path(cnx, resolver) {
+                    continue;
+                }
+                if resolver.retire_pending {
                     continue;
                 }
                 let inflight_polls = resolver.inflight_poll_ids.len();
