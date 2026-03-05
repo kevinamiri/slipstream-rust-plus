@@ -323,7 +323,7 @@ fn decode_slot(
 ) -> Result<DecodeSlotOutcome, ServerError> {
     match decode_query_with_domains(packet, domains) {
         Ok(query) => {
-            let mut peer_storage = dummy_sockaddr_storage();
+            let mut peer_storage = socket_addr_to_storage(peer);
             let mut local_storage = unsafe { std::ptr::read(local_addr_storage) };
             let mut first_cnx: *mut picoquic_cnx_t = std::ptr::null_mut();
             let mut first_path: libc::c_int = -1;
@@ -467,6 +467,7 @@ async fn forward_fallback_replies(
     }
 }
 
+#[cfg(test)]
 fn dummy_sockaddr_storage() -> libc::sockaddr_storage {
     socket_addr_to_storage(SocketAddr::new(
         IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),

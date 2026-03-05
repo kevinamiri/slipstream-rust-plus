@@ -49,6 +49,7 @@ pub(crate) struct ResolverState {
     pub(crate) cooldown_until: u64,
     pub(crate) poor_quality_streak: u32,
     pub(crate) last_quality_eval_at: u64,
+    pub(crate) path_lookup_misses: u32,
     pub(crate) debug: DebugMetrics,
 }
 
@@ -145,6 +146,7 @@ pub(crate) fn resolve_resolvers(
             cooldown_until: 0,
             poor_quality_streak: 0,
             last_quality_eval_at: 0,
+            path_lookup_misses: 0,
             debug: DebugMetrics::new(debug_poll),
         });
     }
@@ -170,6 +172,7 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.cooldown_until = 0;
     resolver.poor_quality_streak = 0;
     resolver.last_quality_eval_at = 0;
+    resolver.path_lookup_misses = 0;
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
     resolver.activated_at = 0;

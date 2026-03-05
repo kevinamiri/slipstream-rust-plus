@@ -4,9 +4,12 @@ use slipstream_core::{
     net::is_transient_udp_error, normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
 use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
+#[cfg(feature = "idle-gc-deferred-delete")]
+use slipstream_ffi::picoquic::picoquic_connection_disconnect;
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
-    picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex, picoquic_quic_t,
+    picoquic_get_cnx_state, picoquic_get_first_cnx, picoquic_get_next_cnx,
+    picoquic_prepare_packet_ex, picoquic_quic_t, picoquic_state_enum,
     slipstream_get_path_probe_debug, slipstream_has_ready_stream, slipstream_is_flow_blocked,
     slipstream_path_probe_debug_t, slipstream_server_cc_algorithm, PICOQUIC_MAX_PACKET_SIZE,
     PICOQUIC_PACKET_LOOP_RECV_MAX,
@@ -29,7 +32,7 @@ use tokio::time::sleep;
 
 use crate::streams::{
     drain_commands, handle_command, handle_shutdown, maybe_report_command_stats,
-    remove_connection_streams, server_callback, ServerState,
+    remove_connection_streams, server_callback, try_rearm_send_backlog, ServerState,
 };
 
 // Protocol defaults; see docs/config.md for details.
@@ -43,8 +46,17 @@ pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+#[cfg(feature = "idle-gc-deferred-delete")]
+const DEFERRED_DELETE_GRACE: Duration = Duration::from_millis(250);
 
 static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "idle-gc-deferred-delete")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeferredDeleteEntry {
+    cnx_id: usize,
+    not_before: Instant,
+}
 
 extern "C" fn handle_sigterm(_signum: libc::c_int) {
     SHOULD_SHUTDOWN.store(true, Ordering::Relaxed);
@@ -283,9 +295,13 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    #[cfg(feature = "idle-gc-deferred-delete")]
+    let mut deferred_delete_queue: Vec<DeferredDeleteEntry> = Vec::new();
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
+        #[cfg(feature = "idle-gc-deferred-delete")]
+        process_deferred_cnx_deletes(quic, &mut deferred_delete_queue, Instant::now());
 
         if SHOULD_SHUTDOWN.load(Ordering::Relaxed) {
             let state = unsafe { &mut *state_ptr };
@@ -359,6 +375,17 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         let now = Instant::now();
         if idle_timeout != Duration::ZERO {
             note_active_connections(&mut last_seen, &slots, now);
+            #[cfg(feature = "idle-gc-deferred-delete")]
+            maybe_gc_idle_connections(
+                quic,
+                state_ptr,
+                &mut last_seen,
+                idle_timeout,
+                &mut last_idle_gc,
+                now,
+                &mut deferred_delete_queue,
+            );
+            #[cfg(not(feature = "idle-gc-deferred-delete"))]
             maybe_gc_idle_connections(
                 quic,
                 state_ptr,
@@ -377,6 +404,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         }
 
         let loop_time = unsafe { picoquic_current_time() };
+        let active_connections = collect_active_connections(quic);
 
         for slot in slots.iter_mut() {
             let mut send_length = 0usize;
@@ -385,55 +413,86 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             let mut if_index: libc::c_int = 0;
 
             if slot.payload_override.is_none() && slot.rcode.is_none() && !slot.cnx.is_null() {
-                let ret = unsafe {
-                    picoquic_prepare_packet_ex(
-                        slot.cnx,
-                        slot.path_id,
-                        loop_time,
-                        send_buf.as_mut_ptr(),
-                        send_buf.len(),
-                        &mut send_length,
-                        &mut addr_to,
-                        &mut addr_from,
-                        &mut if_index,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ret < 0 {
-                    let peer_storage = socket_addr_to_storage(slot.peer);
-                    let mut probe_debug = slipstream_path_probe_debug_t::default();
-                    let _ = unsafe {
-                        slipstream_get_path_probe_debug(
-                            slot.cnx,
-                            &peer_storage as *const _ as *const libc::sockaddr,
-                            &local_addr_storage as *const _ as *const libc::sockaddr,
-                            &mut probe_debug as *mut _,
-                        )
-                    };
+                let cnx_id = slot.cnx as usize;
+                let mut can_prepare = true;
+                if !active_connections.contains_key(&cnx_id) {
                     tracing::warn!(
-                        "prepare_packet_ex failed: ret={} cnx={} path_id={} peer={} nb_paths={} target_limit={} max_path_id_local={} max_path_id_remote={} local_initial_max_path_id={} remote_initial_max_path_id={} remote_active_cid_limit={} has_remote_cid_stash={} multipath_enabled={} migration_disabled_local={} migration_disabled_remote={} reason_code={} existing_path_id={} partial_match_path_id={}",
-                        ret,
-                        slot.cnx as usize,
+                        "Skipping send on stale connection pointer cnx={} path_id={} peer={}",
+                        cnx_id,
                         slot.path_id,
-                        slot.peer,
-                        probe_debug.nb_paths,
-                        probe_debug.path_target_limit,
-                        probe_debug.max_path_id_local,
-                        probe_debug.max_path_id_remote,
-                        probe_debug.local_initial_max_path_id,
-                        probe_debug.remote_initial_max_path_id,
-                        probe_debug.remote_active_connection_id_limit,
-                        probe_debug.has_remote_cnxid_stash != 0,
-                        probe_debug.is_multipath_enabled != 0,
-                        probe_debug.migration_disabled_local != 0,
-                        probe_debug.migration_disabled_remote != 0,
-                        probe_debug.reason_code,
-                        probe_debug.existing_path_id,
-                        probe_debug.partial_match_path_id
+                        slot.peer
                     );
                     slot.payload_override = None;
                     slot.rcode = Some(Rcode::ServerFailure);
-                    send_length = 0;
+                    can_prepare = false;
+                }
+                if can_prepare {
+                    let cnx_state = unsafe { picoquic_get_cnx_state(slot.cnx) };
+                    if !connection_state_can_prepare(cnx_state) {
+                        tracing::warn!(
+                            "Skipping send on non-usable connection state {:?} cnx={} path_id={} peer={}",
+                            cnx_state,
+                            cnx_id,
+                            slot.path_id,
+                            slot.peer
+                        );
+                        slot.payload_override = None;
+                        slot.rcode = Some(Rcode::ServerFailure);
+                        can_prepare = false;
+                    }
+                }
+                if can_prepare {
+                    let path_id_request = if slot.path_id >= 0 { slot.path_id } else { -1 };
+                    let ret = unsafe {
+                        picoquic_prepare_packet_ex(
+                            slot.cnx,
+                            path_id_request,
+                            loop_time,
+                            send_buf.as_mut_ptr(),
+                            send_buf.len(),
+                            &mut send_length,
+                            &mut addr_to,
+                            &mut addr_from,
+                            &mut if_index,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if ret < 0 {
+                        let peer_storage = socket_addr_to_storage(slot.peer);
+                        let mut probe_debug = slipstream_path_probe_debug_t::default();
+                        let _ = unsafe {
+                            slipstream_get_path_probe_debug(
+                                slot.cnx,
+                                &peer_storage as *const _ as *const libc::sockaddr,
+                                &local_addr_storage as *const _ as *const libc::sockaddr,
+                                &mut probe_debug as *mut _,
+                            )
+                        };
+                        tracing::warn!(
+                            "prepare_packet_ex failed: ret={} cnx={} path_id={} peer={} nb_paths={} target_limit={} max_path_id_local={} max_path_id_remote={} local_initial_max_path_id={} remote_initial_max_path_id={} remote_active_cid_limit={} has_remote_cid_stash={} multipath_enabled={} migration_disabled_local={} migration_disabled_remote={} reason_code={} existing_path_id={} partial_match_path_id={}",
+                            ret,
+                            slot.cnx as usize,
+                            slot.path_id,
+                            slot.peer,
+                            probe_debug.nb_paths,
+                            probe_debug.path_target_limit,
+                            probe_debug.max_path_id_local,
+                            probe_debug.max_path_id_remote,
+                            probe_debug.local_initial_max_path_id,
+                            probe_debug.remote_initial_max_path_id,
+                            probe_debug.remote_active_connection_id_limit,
+                            probe_debug.has_remote_cnxid_stash != 0,
+                            probe_debug.is_multipath_enabled != 0,
+                            probe_debug.migration_disabled_local != 0,
+                            probe_debug.migration_disabled_remote != 0,
+                            probe_debug.reason_code,
+                            probe_debug.existing_path_id,
+                            probe_debug.partial_match_path_id
+                        );
+                        slot.payload_override = None;
+                        slot.rcode = Some(Rcode::ServerFailure);
+                        send_length = 0;
+                    }
                 }
 
                 if send_length == 0 {
@@ -490,6 +549,18 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                             probe_debug.reason_code,
                             send_backlog
                         );
+                        if !has_ready_stream {
+                            let rearm = try_rearm_send_backlog(state_ptr, slot.cnx, cnx_id, 8);
+                            if rearm.attempted > 0 && (rearm.activated > 0 || rearm.dropped > 0) {
+                                tracing::warn!(
+                                    "server stall recovery: cnx={} attempted={} activated={} dropped={}",
+                                    cnx_id,
+                                    rearm.attempted,
+                                    rearm.activated,
+                                    rearm.dropped
+                                );
+                            }
+                        }
                         last_flow_block_log_at = loop_time;
                     }
                 }
@@ -611,6 +682,7 @@ fn prune_and_collect_idle<T>(
     idle
 }
 
+#[cfg(not(feature = "idle-gc-deferred-delete"))]
 fn maybe_gc_idle_connections(
     quic: *mut picoquic_quic_t,
     state_ptr: *mut ServerState,
@@ -656,13 +728,133 @@ fn maybe_gc_idle_connections(
                     now.duration_since(*last).as_millis()
                 );
             }
-            unsafe {
-                picoquic_delete_cnx(cnx);
-            }
+            unsafe { picoquic_delete_cnx(cnx) };
             last_seen.remove(&cnx_id);
         }
     }
     *last_gc = now;
+}
+
+#[cfg(feature = "idle-gc-deferred-delete")]
+fn maybe_gc_idle_connections(
+    quic: *mut picoquic_quic_t,
+    state_ptr: *mut ServerState,
+    last_seen: &mut HashMap<usize, Instant>,
+    idle_timeout: Duration,
+    last_gc: &mut Instant,
+    now: Instant,
+    deferred_delete_queue: &mut Vec<DeferredDeleteEntry>,
+) {
+    if last_seen.is_empty() {
+        return;
+    }
+    if now.duration_since(*last_gc) < IDLE_GC_INTERVAL {
+        return;
+    }
+
+    let active = collect_active_connections(quic);
+    if active.is_empty() {
+        last_seen.clear();
+        *last_gc = now;
+        return;
+    }
+
+    if last_seen.is_empty() {
+        *last_gc = now;
+        return;
+    }
+
+    let idle = prune_and_collect_idle(last_seen, &active, idle_timeout, now);
+
+    if idle.is_empty() {
+        *last_gc = now;
+        return;
+    }
+
+    let state = unsafe { &mut *state_ptr };
+    for cnx_id in idle {
+        if let Some(&cnx) = active.get(&cnx_id) {
+            remove_connection_streams(state, cnx_id);
+            if let Some(last) = last_seen.get(&cnx_id) {
+                tracing::debug!(
+                    "idle gc: queueing deferred delete cnx_id={} idle_for_ms={}",
+                    cnx_id,
+                    now.duration_since(*last).as_millis()
+                );
+            }
+            unsafe { picoquic_connection_disconnect(cnx) };
+            enqueue_deferred_delete(deferred_delete_queue, cnx_id, now);
+            last_seen.remove(&cnx_id);
+        }
+    }
+    *last_gc = now;
+}
+
+#[cfg(feature = "idle-gc-deferred-delete")]
+fn enqueue_deferred_delete(
+    deferred_delete_queue: &mut Vec<DeferredDeleteEntry>,
+    cnx_id: usize,
+    now: Instant,
+) {
+    if deferred_delete_queue
+        .iter()
+        .any(|entry| entry.cnx_id == cnx_id)
+    {
+        return;
+    }
+    deferred_delete_queue.push(DeferredDeleteEntry {
+        cnx_id,
+        not_before: now + DEFERRED_DELETE_GRACE,
+    });
+}
+
+#[cfg(feature = "idle-gc-deferred-delete")]
+fn process_deferred_cnx_deletes(
+    quic: *mut picoquic_quic_t,
+    deferred_delete_queue: &mut Vec<DeferredDeleteEntry>,
+    now: Instant,
+) {
+    if deferred_delete_queue.is_empty() {
+        return;
+    }
+    let mut remaining = Vec::with_capacity(deferred_delete_queue.len());
+    for entry in deferred_delete_queue.drain(..) {
+        if now < entry.not_before {
+            remaining.push(entry);
+            continue;
+        }
+        if let Some(cnx) = find_connection_by_id(quic, entry.cnx_id) {
+            tracing::debug!(
+                "deferred delete: deleting connection cnx_id={}",
+                entry.cnx_id
+            );
+            unsafe { picoquic_delete_cnx(cnx) };
+        }
+    }
+    *deferred_delete_queue = remaining;
+}
+
+#[cfg(feature = "idle-gc-deferred-delete")]
+fn find_connection_by_id(quic: *mut picoquic_quic_t, cnx_id: usize) -> Option<*mut picoquic_cnx_t> {
+    let mut cnx = unsafe { picoquic_get_first_cnx(quic) };
+    while !cnx.is_null() {
+        if cnx as usize == cnx_id {
+            return Some(cnx);
+        }
+        cnx = unsafe { picoquic_get_next_cnx(cnx) };
+    }
+    None
+}
+
+fn connection_state_can_prepare(state: picoquic_state_enum) -> bool {
+    !matches!(
+        state,
+        picoquic_state_enum::picoquic_state_disconnecting
+            | picoquic_state_enum::picoquic_state_closing_received
+            | picoquic_state_enum::picoquic_state_closing
+            | picoquic_state_enum::picoquic_state_draining
+            | picoquic_state_enum::picoquic_state_disconnected
+    )
 }
 
 fn warn_overlapping_domains(domains: &[String]) {

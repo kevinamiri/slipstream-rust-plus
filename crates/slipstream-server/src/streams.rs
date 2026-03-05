@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, warn};
 
 static INVARIANT_REPORTER: InvariantReporter = InvariantReporter::new(1_000_000);
+const PICOQUIC_ERROR_CANNOT_SET_ACTIVE_STREAM: i32 = 0x400 + 36;
 
 pub(crate) struct ServerState {
     target_addr: SocketAddr,
@@ -71,6 +72,13 @@ pub(crate) struct BacklogStreamSummary {
     pub(crate) fin_enqueued: bool,
     pub(crate) queued_bytes: u64,
     pub(crate) pending_chunks: usize,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct BacklogRearmStats {
+    pub(crate) attempted: usize,
+    pub(crate) activated: usize,
+    pub(crate) dropped: usize,
 }
 
 impl ServerStreamMetrics {
@@ -278,6 +286,102 @@ fn check_stream_invariants(state: &ServerState, key: StreamKey, context: &str) {
             )
         });
     }
+}
+
+fn is_recoverable_mark_active_failure(ret: i32) -> bool {
+    ret == PICOQUIC_ERROR_CANNOT_SET_ACTIVE_STREAM
+}
+
+pub(crate) fn try_rearm_send_backlog(
+    state_ptr: *mut ServerState,
+    cnx: *mut picoquic_cnx_t,
+    cnx_id: usize,
+    limit: usize,
+) -> BacklogRearmStats {
+    if state_ptr.is_null() || cnx.is_null() || limit == 0 {
+        return BacklogRearmStats::default();
+    }
+    let state = unsafe { &mut *state_ptr };
+    let mut candidates = Vec::new();
+    for (key, stream) in state.streams.iter() {
+        if key.cnx != cnx_id {
+            continue;
+        }
+        let send_pending = stream
+            .send_pending
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let has_stash = stream
+            .send_stash
+            .as_ref()
+            .is_some_and(|stash| !stash.is_empty());
+        if send_pending || has_stash || stream.target_fin_pending {
+            candidates.push(*key);
+            if candidates.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    let mut stats = BacklogRearmStats::default();
+    let mut to_drop = Vec::new();
+    for key in candidates {
+        let Some(stream) = state.streams.get(&key) else {
+            continue;
+        };
+        let send_pending = stream
+            .send_pending
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let send_stash_bytes = stream
+            .send_stash
+            .as_ref()
+            .map(|stash| stash.len())
+            .unwrap_or(0);
+        if !send_pending && send_stash_bytes == 0 && !stream.target_fin_pending {
+            continue;
+        }
+        stats.attempted = stats.attempted.saturating_add(1);
+        let ret =
+            unsafe { picoquic_mark_active_stream(cnx, key.stream_id, 1, std::ptr::null_mut()) };
+        if ret == 0 {
+            stats.activated = stats.activated.saturating_add(1);
+            continue;
+        }
+        if is_recoverable_mark_active_failure(ret) {
+            to_drop.push(key);
+            continue;
+        }
+        warn!(
+            "stream {:?}: backlog rearm failed ret={} send_pending={} send_stash_bytes={} target_fin_pending={} queued={} pending_chunks={}",
+            key.stream_id,
+            ret,
+            send_pending,
+            send_stash_bytes,
+            stream.target_fin_pending,
+            stream.flow.queued_bytes,
+            stream.pending_data.len()
+        );
+    }
+
+    for key in to_drop {
+        if let Some(stream) = shutdown_stream(state, key) {
+            warn!(
+                "stream {:?}: dropping stale backlog after cannot_set_active_stream tx_bytes={} rx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
+                key.stream_id,
+                stream.tx_bytes,
+                stream.flow.rx_bytes,
+                stream.flow.queued_bytes,
+                stream.flow.consumed_offset,
+                stream.flow.fin_offset
+            );
+            stats.dropped = stats.dropped.saturating_add(1);
+        }
+    }
+
+    stats
 }
 
 #[derive(Default)]
@@ -919,6 +1023,7 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                 if ret != 0 {
                     const MARK_ACTIVE_FAIL_LOG_INTERVAL_US: u64 = 1_000_000;
                     let now = unsafe { picoquic_current_time() };
+                    let recoverable = is_recoverable_mark_active_failure(ret);
                     if now.saturating_sub(state.last_mark_active_fail_log_at)
                         >= MARK_ACTIVE_FAIL_LOG_INTERVAL_US
                     {
@@ -944,12 +1049,12 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                             pending_chunks: stream.pending_data.len(),
                         };
                         warn!(
-                            "stream {:?}: mark_active_stream fin failed ret={} backlog={:?}",
-                            stream_id, ret, backlog
+                            "stream {:?}: mark_active_stream fin failed ret={} recoverable={} backlog={:?}",
+                            stream_id, ret, recoverable, backlog
                         );
                         state.last_mark_active_fail_log_at = now;
                     }
-                    if !forced_failure {
+                    if !forced_failure && !recoverable {
                         unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                     }
                     remove_stream = true;
@@ -987,18 +1092,20 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
             let ret =
                 unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
             if ret != 0 {
+                let recoverable = is_recoverable_mark_active_failure(ret);
                 if let Some(stream) = shutdown_stream(state, key) {
                     warn!(
-                        "stream {:?}: mark_active_stream readable failed ret={} tx_bytes={} rx_bytes={} consumed_offset={} queued={} fin_offset={:?}",
+                        "stream {:?}: mark_active_stream readable failed ret={} recoverable={} tx_bytes={} rx_bytes={} consumed_offset={} queued={} fin_offset={:?}",
                         stream_id,
                         ret,
+                        recoverable,
                         stream.tx_bytes,
                         stream.flow.rx_bytes,
                         stream.flow.consumed_offset,
                         stream.flow.queued_bytes,
                         stream.flow.fin_offset
                     );
-                    if !forced_failure {
+                    if !forced_failure && !recoverable {
                         unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
                     }
                 } else if state.debug_streams {

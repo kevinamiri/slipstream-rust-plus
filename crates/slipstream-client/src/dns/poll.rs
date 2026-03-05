@@ -13,6 +13,7 @@ use super::resolver::{sockaddr_storage_to_socket_addr, ResolverState};
 use slipstream_core::normalize_dual_stack_addr;
 
 const AUTHORITATIVE_POLL_TIMEOUT_US: u64 = 5_000_000;
+const PICOQUIC_ERROR_DISCONNECTED: i32 = 0x400 + 20;
 
 pub(crate) fn expire_inflight_polls(inflight_poll_ids: &mut HashMap<u16, u64>, now: u64) {
     if inflight_poll_ids.is_empty() {
@@ -72,7 +73,14 @@ pub(crate) async fn send_poll_queries(
             )
         };
         if ret < 0 {
-            return Err(ClientError::new("Failed preparing poll packet"));
+            if ret == PICOQUIC_ERROR_DISCONNECTED {
+                *remaining = remaining_count;
+                break;
+            }
+            resolver.failure_streak = resolver.failure_streak.saturating_add(1);
+            resolver.last_failure_at = current_time;
+            *remaining = remaining_count;
+            break;
         }
         if send_length == 0 || addr_to.ss_family == 0 {
             *remaining = remaining_count;

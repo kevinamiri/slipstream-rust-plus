@@ -83,6 +83,7 @@ pub(crate) fn drain_path_events(
                             resolver.unique_path_id = Some(unique_path_id);
                             resolver.path_id = path_id;
                             resolver.added = true;
+                            resolver.path_lookup_misses = 0;
                             resolver.retire_pending = false;
                             resolver.state = ResolverHealthState::Active;
                             if resolver.activated_at == 0 {

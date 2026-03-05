@@ -164,11 +164,6 @@ fn main() {
     } else {
         sip003::last_option_value(&sip003_env.plugin_options, "cert")
     };
-    if cert.is_none() {
-        tracing::warn!(
-            "Server certificate pinning is disabled; this allows MITM. Provide --cert to pin the server leaf, or dismiss this if your underlying tunnel provides authentication."
-        );
-    }
 
     let keep_alive_interval = if cli_provided(&matches, "keep_alive_interval") {
         args.keep_alive_interval

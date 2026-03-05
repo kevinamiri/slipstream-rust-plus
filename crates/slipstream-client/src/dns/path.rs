@@ -14,6 +14,7 @@ use super::resolver::{reset_resolver_path, ResolverHealthState, ResolverState};
 
 const PATH_PROBE_INITIAL_DELAY_US: u64 = 250_000;
 const PATH_PROBE_MAX_DELAY_US: u64 = 10_000_000;
+const PATH_LOOKUP_MISS_RESET_THRESHOLD: u32 = 4;
 
 fn probe_reason_label(reason_code: i32) -> &'static str {
     match reason_code {
@@ -54,6 +55,7 @@ pub(crate) fn refresh_resolver_path(
         let path_id = unsafe { slipstream_get_path_id_from_unique(cnx, unique_path_id) };
         if path_id >= 0 {
             resolver.added = true;
+            resolver.path_lookup_misses = 0;
             if resolver.path_id != path_id {
                 resolver.path_id = path_id;
             }
@@ -62,17 +64,24 @@ pub(crate) fn refresh_resolver_path(
         }
         resolver.unique_path_id = None;
     }
-    let peer = &resolver.storage as *const _ as *const libc::sockaddr;
-    let path_id = unsafe { slipstream_find_path_id_by_addr(cnx, peer) };
+    let path_id = existing_path_id(cnx, resolver);
     if path_id < 0 {
         if resolver.added || resolver.path_id >= 0 {
-            reset_resolver_path(resolver);
-            resolver.next_probe_at = 0;
+            resolver.path_lookup_misses = resolver.path_lookup_misses.saturating_add(1);
+            if resolver.path_lookup_misses >= PATH_LOOKUP_MISS_RESET_THRESHOLD {
+                reset_resolver_path(resolver);
+                resolver.next_probe_at = 0;
+            } else {
+                // Keep occupying the slot briefly to avoid churn when picoquic temporarily
+                // cannot map addr->path while the path still exists internally.
+                return resolver.path_id >= 0 && resolver.added;
+            }
         }
         return false;
     }
 
     resolver.added = true;
+    resolver.path_lookup_misses = 0;
     resolver.state = ResolverHealthState::Active;
     if resolver.activated_at == 0 {
         resolver.activated_at = unsafe { picoquic_current_time() };
@@ -137,11 +146,21 @@ pub(crate) fn add_paths(
                 &mut path_id,
             )
         };
+        let mut probe_debug = slipstream_path_probe_debug_t::default();
+        let _ = unsafe {
+            slipstream_get_path_probe_debug(
+                cnx,
+                &resolver.storage as *const _ as *const libc::sockaddr,
+                &local_storage as *const _ as *const libc::sockaddr,
+                &mut probe_debug as *mut _,
+            )
+        };
         if ret == 0 && path_id >= 0 {
             resolver.added = true;
             resolver.retire_pending = false;
             resolver.state = ResolverHealthState::Active;
             resolver.path_id = path_id;
+            resolver.path_lookup_misses = 0;
             resolver.activated_at = now;
             resolver.last_success_at = now;
             resolver.success_rate_ewma = (resolver.success_rate_ewma * 0.8) + 0.2;
@@ -156,20 +175,31 @@ pub(crate) fn add_paths(
             );
             continue;
         }
+
+        if probe_debug.reason_code == 2 && probe_debug.existing_path_id >= 0 {
+            resolver.added = true;
+            resolver.retire_pending = false;
+            resolver.state = ResolverHealthState::Active;
+            resolver.path_id = probe_debug.existing_path_id;
+            resolver.path_lookup_misses = 0;
+            resolver.activated_at = now;
+            resolver.last_success_at = now;
+            resolver.failure_streak = 0;
+            resolver.next_probe_at = 0;
+            resolver.last_probe_reason_code = i32::MIN;
+            resolver.last_probe_reason_repeats = 0;
+            info!(
+                "MULTIPATH: Reusing existing path for {} (path_id={})",
+                resolver.addr, resolver.path_id
+            );
+            continue;
+        }
+
         resolver.probe_attempts = resolver.probe_attempts.saturating_add(1);
         resolver.failure_streak = resolver.failure_streak.saturating_add(1);
         resolver.last_failure_at = now;
         resolver.state = ResolverHealthState::Cooldown;
         resolver.success_rate_ewma *= 0.9;
-        let mut probe_debug = slipstream_path_probe_debug_t::default();
-        let _ = unsafe {
-            slipstream_get_path_probe_debug(
-                cnx,
-                &resolver.storage as *const _ as *const libc::sockaddr,
-                &local_storage as *const _ as *const libc::sockaddr,
-                &mut probe_debug as *mut _,
-            )
-        };
         let reason_changed = resolver.last_probe_reason_code != probe_debug.reason_code;
         if reason_changed {
             resolver.last_probe_reason_code = probe_debug.reason_code;
@@ -253,4 +283,25 @@ fn apply_probe_jitter(delay: u64, addr: std::net::SocketAddr, attempts: u32) -> 
         .saturating_sub(jitter_window)
         .saturating_add(jitter)
         .min(PATH_PROBE_MAX_DELAY_US)
+}
+
+fn existing_path_id(cnx: *mut picoquic_cnx_t, resolver: &ResolverState) -> libc::c_int {
+    let peer = &resolver.storage as *const _ as *const libc::sockaddr;
+    let direct = unsafe { slipstream_find_path_id_by_addr(cnx, peer) };
+    if direct >= 0 {
+        return direct;
+    }
+    let mut probe_debug = slipstream_path_probe_debug_t::default();
+    let local = resolver
+        .local_addr_storage
+        .as_ref()
+        .map(|storage| storage as *const _ as *const libc::sockaddr)
+        .unwrap_or(std::ptr::null());
+    let _ =
+        unsafe { slipstream_get_path_probe_debug(cnx, peer, local, &mut probe_debug as *mut _) };
+    if probe_debug.existing_path_id >= 0 {
+        probe_debug.existing_path_id
+    } else {
+        -1
+    }
 }

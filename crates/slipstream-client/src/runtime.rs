@@ -53,6 +53,7 @@ const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 const PATH_PREPARE_FAILURE_COOLDOWN_US: u64 = 1_000_000;
 const PATH_PREPARE_FAILURE_THRESHOLD: u32 = 3;
+const PICOQUIC_ERROR_DISCONNECTED: i32 = 0x400 + 20;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -380,6 +381,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let mut send_msg_size: libc::size_t = 0;
 
                 let mut packet_produced = false;
+                let mut disconnected_prepare = false;
                 let resolver_count = resolvers.len();
                 if resolver_count == 0 {
                     break;
@@ -432,6 +434,15 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     };
 
                     if ret != 0 {
+                        if ret == PICOQUIC_ERROR_DISCONNECTED {
+                            disconnected_prepare = true;
+                            warn!(
+                                "picoquic_prepare_packet_ex returned disconnected (code {}) on path {}",
+                                ret,
+                                resolver.addr
+                            );
+                            break;
+                        }
                         resolver.prepare_failures = resolver.prepare_failures.saturating_add(1);
                         resolver.scheduler_credit = (resolver.scheduler_credit - 0.5).max(-4.0);
                         if resolver.prepare_failures >= PATH_PREPARE_FAILURE_THRESHOLD {
@@ -461,6 +472,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     } else {
                         resolver.scheduler_credit = (resolver.scheduler_credit - 0.1).max(-4.0);
                     }
+                }
+                if disconnected_prepare {
+                    break;
                 }
 
                 if !packet_produced {
