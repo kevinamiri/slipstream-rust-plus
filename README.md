@@ -80,3 +80,10 @@ When testing with public resolvers (`--resolver 8.8.8.8`, etc.), make sure all o
 ## License
 
 This project is licensed under GPLv3. See `LICENSE`.
+
+4.2.2.1
+4.2.2.2
+4.2.2.3
+4.2.2.4
+4.2.2.5
+4.2.2.6

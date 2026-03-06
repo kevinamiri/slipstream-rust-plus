@@ -107,21 +107,14 @@ impl ResolverState {
     }
 }
 
-pub(crate) fn resolve_resolvers_with_bootstrap(
+pub(crate) fn resolve_resolvers(
     resolvers: &[ResolverSpec],
     mtu: u32,
     debug_poll: bool,
-    bootstrap_index: usize,
 ) -> Result<Vec<ResolverState>, ClientError> {
     let mut resolved = Vec::with_capacity(resolvers.len());
     let mut seen = HashMap::new();
-    if resolvers.is_empty() {
-        return Ok(resolved);
-    }
-    let start = bootstrap_index % resolvers.len();
-    for offset in 0..resolvers.len() {
-        let idx = (start + offset) % resolvers.len();
-        let resolver = &resolvers[idx];
+    for (idx, resolver) in resolvers.iter().enumerate() {
         let addr = resolve_host_port(&resolver.resolver)
             .map_err(|err| ClientError::new(err.to_string()))?;
         let addr = normalize_dual_stack_addr(addr);
@@ -132,7 +125,7 @@ pub(crate) fn resolve_resolvers_with_bootstrap(
             )));
         }
         seen.insert(addr, resolver.mode);
-        let is_primary = offset == 0;
+        let is_primary = idx == 0;
         resolved.push(ResolverState {
             addr,
             storage: socket_addr_to_storage(addr),
@@ -222,7 +215,7 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_resolvers_with_bootstrap;
+    use super::resolve_resolvers;
     use slipstream_core::{AddressFamily, HostPort};
     use slipstream_ffi::{ResolverMode, ResolverSpec};
 
@@ -247,50 +240,9 @@ mod tests {
             },
         ];
 
-        match resolve_resolvers_with_bootstrap(&resolvers, 900, false, 0) {
+        match resolve_resolvers(&resolvers, 900, false) {
             Ok(_) => panic!("expected duplicate resolver error"),
             Err(err) => assert!(err.to_string().contains("Duplicate resolver address")),
         }
-    }
-
-    #[test]
-    fn bootstrap_rotation_promotes_selected_resolver() {
-        let resolvers = vec![
-            ResolverSpec {
-                resolver: HostPort {
-                    host: "127.0.0.1".to_string(),
-                    port: 5301,
-                    family: AddressFamily::V4,
-                },
-                mode: ResolverMode::Recursive,
-            },
-            ResolverSpec {
-                resolver: HostPort {
-                    host: "127.0.0.1".to_string(),
-                    port: 5302,
-                    family: AddressFamily::V4,
-                },
-                mode: ResolverMode::Recursive,
-            },
-            ResolverSpec {
-                resolver: HostPort {
-                    host: "127.0.0.1".to_string(),
-                    port: 5303,
-                    family: AddressFamily::V4,
-                },
-                mode: ResolverMode::Recursive,
-            },
-        ];
-
-        let resolved =
-            resolve_resolvers_with_bootstrap(&resolvers, 900, false, 1).expect("should resolve");
-        assert_eq!(resolved.len(), 3);
-        assert_eq!(resolved[0].addr.port(), 5302);
-        assert!(resolved[0].added);
-        assert_eq!(resolved[0].path_id, 0);
-        assert_eq!(resolved[1].addr.port(), 5303);
-        assert!(!resolved[1].added);
-        assert_eq!(resolved[2].addr.port(), 5301);
-        assert!(!resolved[2].added);
     }
 }

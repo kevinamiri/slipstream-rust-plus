@@ -180,7 +180,7 @@ fn dns_response_id(packet: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::maybe_fallback_recursive_qtype;
-    use crate::dns::resolve_resolvers_with_bootstrap;
+    use crate::dns::resolve_resolvers;
     use slipstream_core::{AddressFamily, HostPort};
     use slipstream_dns::{RR_A, RR_AAAA, RR_TXT};
     use slipstream_ffi::{ResolverMode, ResolverSpec};
@@ -194,8 +194,7 @@ mod tests {
             },
             mode: ResolverMode::Recursive,
         }];
-        let mut resolved =
-            resolve_resolvers_with_bootstrap(&specs, 1200, false, 0).expect("resolver setup");
+        let mut resolved = resolve_resolvers(&specs, 1200, false).expect("resolver setup");
         resolved.remove(0)
     }
 
