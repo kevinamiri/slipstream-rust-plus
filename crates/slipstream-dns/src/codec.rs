@@ -4,7 +4,7 @@ use crate::dots;
 use crate::name::{encode_name, extract_subdomain_multi, parse_name};
 use crate::types::{
     DecodeQueryError, DecodedQuery, DnsError, QueryParams, Rcode, ResponseParams, EDNS_UDP_PAYLOAD,
-    RR_OPT, RR_TXT,
+    RR_A, RR_AAAA, RR_OPT, RR_TXT,
 };
 use crate::wire::{
     parse_header, parse_question, parse_question_for_reply, read_u16, read_u32, write_u16,
@@ -54,13 +54,20 @@ pub fn decode_query_with_domains(
         Err(_) => return Err(DecodeQueryError::Drop),
     };
 
-    if question.qtype != RR_TXT {
+    if question.qtype != RR_TXT && question.qtype != RR_AAAA {
+        // Recursive resolvers may probe companion A records even when the client asked for AAAA.
+        // Returning NOERROR/NODATA for A avoids negative-cache poisoning on the encoded QNAME.
+        let rcode = if question.qtype == RR_A {
+            Rcode::Ok
+        } else {
+            Rcode::NameError
+        };
         return Err(DecodeQueryError::Reply {
             id: header.id,
             rd,
             cd,
             question: Some(question),
-            rcode: Rcode::NameError,
+            rcode,
         });
     }
 
@@ -255,7 +262,23 @@ pub fn encode_response(params: &ResponseParams<'_>) -> Result<Vec<u8>, DnsError>
 
     let mut ancount = 0u16;
     if payload_len > 0 && rcode == Rcode::Ok {
-        ancount = 1;
+        ancount = match params.question.qtype {
+            RR_TXT => 1,
+            RR_AAAA => {
+                let framed_len = payload_len
+                    .checked_add(2)
+                    .ok_or_else(|| DnsError::new("payload too long"))?;
+                // Each AAAA answer has:
+                // - 2 bytes sequence index
+                // - 14 bytes payload chunk
+                let answers = framed_len.div_ceil(14);
+                if answers > u16::MAX as usize {
+                    return Err(DnsError::new("payload too long"));
+                }
+                answers as u16
+            }
+            _ => return Err(DnsError::new("unsupported qtype for payload")),
+        };
     } else if params.rcode.is_some() {
         rcode = params.rcode.unwrap_or(Rcode::Ok);
     }
@@ -281,27 +304,53 @@ pub fn encode_response(params: &ResponseParams<'_>) -> Result<Vec<u8>, DnsError>
     write_u16(&mut out, params.question.qtype);
     write_u16(&mut out, params.question.qclass);
 
-    if ancount == 1 {
-        out.extend_from_slice(&[0xC0, 0x0C]);
-        write_u16(&mut out, params.question.qtype);
-        write_u16(&mut out, params.question.qclass);
-        write_u32(&mut out, 60);
-        let chunk_count = payload_len.div_ceil(255);
-        let rdata_len = payload_len + chunk_count;
-        if rdata_len > u16::MAX as usize {
-            return Err(DnsError::new("payload too long"));
-        }
-        write_u16(&mut out, rdata_len as u16);
-        if let Some(payload) = params.payload {
-            let mut remaining = payload_len;
-            let mut cursor = 0;
-            while remaining > 0 {
-                let chunk_len = remaining.min(255);
-                out.push(chunk_len as u8);
-                out.extend_from_slice(&payload[cursor..cursor + chunk_len]);
-                cursor += chunk_len;
-                remaining -= chunk_len;
+    if ancount > 0 {
+        let payload = params.payload.unwrap_or(&[]);
+        match params.question.qtype {
+            RR_TXT => {
+                out.extend_from_slice(&[0xC0, 0x0C]);
+                write_u16(&mut out, params.question.qtype);
+                write_u16(&mut out, params.question.qclass);
+                write_u32(&mut out, 60);
+                let chunk_count = payload_len.div_ceil(255);
+                let rdata_len = payload_len + chunk_count;
+                if rdata_len > u16::MAX as usize {
+                    return Err(DnsError::new("payload too long"));
+                }
+                write_u16(&mut out, rdata_len as u16);
+                let mut remaining = payload_len;
+                let mut cursor = 0;
+                while remaining > 0 {
+                    let chunk_len = remaining.min(255);
+                    out.push(chunk_len as u8);
+                    out.extend_from_slice(&payload[cursor..cursor + chunk_len]);
+                    cursor += chunk_len;
+                    remaining -= chunk_len;
+                }
             }
+            RR_AAAA => {
+                if payload_len > u16::MAX as usize {
+                    return Err(DnsError::new("payload too long"));
+                }
+                let mut framed = Vec::with_capacity(payload_len + 2);
+                framed.extend_from_slice(&(payload_len as u16).to_be_bytes());
+                framed.extend_from_slice(payload);
+                for (seq, chunk) in framed.chunks(14).enumerate() {
+                    let seq =
+                        u16::try_from(seq).map_err(|_| DnsError::new("too many AAAA chunks"))?;
+                    out.extend_from_slice(&[0xC0, 0x0C]);
+                    write_u16(&mut out, params.question.qtype);
+                    write_u16(&mut out, params.question.qclass);
+                    write_u32(&mut out, 60);
+                    write_u16(&mut out, 16);
+                    out.extend_from_slice(&seq.to_be_bytes());
+                    out.extend_from_slice(chunk);
+                    if chunk.len() < 14 {
+                        out.resize(out.len() + (14 - chunk.len()), 0);
+                    }
+                }
+            }
+            _ => return Err(DnsError::new("unsupported qtype for payload")),
         }
     }
 
@@ -319,7 +368,7 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
     if rcode != Rcode::Ok {
         return None;
     }
-    if header.ancount != 1 {
+    if header.ancount == 0 {
         return None;
     }
 
@@ -333,44 +382,107 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
         offset += 4;
     }
 
-    let (_, new_offset) = parse_name(packet, offset).ok()?;
-    offset = new_offset;
-    if offset + 10 > packet.len() {
-        return None;
-    }
-    let qtype = read_u16(packet, offset)?;
-    offset += 2;
-    let _qclass = read_u16(packet, offset)?;
-    offset += 2;
-    let _ttl = read_u32(packet, offset)?;
-    offset += 4;
-    let rdlen = read_u16(packet, offset)? as usize;
-    offset += 2;
-    if offset + rdlen > packet.len() || rdlen < 1 {
-        return None;
-    }
-    if qtype != RR_TXT {
-        return None;
-    }
+    let mut answer_qtype = None;
+    let mut txt_payload = Vec::new();
+    let mut aaaa_chunks = Vec::new();
 
-    let mut remaining = rdlen;
-    let mut cursor = offset;
-    let mut out = Vec::with_capacity(rdlen);
-    while remaining > 0 {
-        let txt_len = packet[cursor] as usize;
-        cursor += 1;
-        remaining -= 1;
-        if txt_len > remaining {
+    for _ in 0..header.ancount {
+        let (_, new_offset) = parse_name(packet, offset).ok()?;
+        offset = new_offset;
+        if offset + 10 > packet.len() {
             return None;
         }
-        out.extend_from_slice(&packet[cursor..cursor + txt_len]);
-        cursor += txt_len;
-        remaining -= txt_len;
+        let qtype = read_u16(packet, offset)?;
+        offset += 2;
+        let _qclass = read_u16(packet, offset)?;
+        offset += 2;
+        let _ttl = read_u32(packet, offset)?;
+        offset += 4;
+        let rdlen = read_u16(packet, offset)? as usize;
+        offset += 2;
+        if offset + rdlen > packet.len() || rdlen < 1 {
+            return None;
+        }
+
+        if let Some(existing) = answer_qtype {
+            if existing != qtype {
+                return None;
+            }
+        } else {
+            answer_qtype = Some(qtype);
+        }
+
+        match qtype {
+            RR_TXT => {
+                let mut remaining = rdlen;
+                let mut cursor = offset;
+                while remaining > 0 {
+                    let txt_len = packet[cursor] as usize;
+                    cursor += 1;
+                    remaining -= 1;
+                    if txt_len > remaining {
+                        return None;
+                    }
+                    txt_payload.extend_from_slice(&packet[cursor..cursor + txt_len]);
+                    cursor += txt_len;
+                    remaining -= txt_len;
+                }
+            }
+            RR_AAAA => {
+                if rdlen != 16 {
+                    return None;
+                }
+                let seq = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+                let mut chunk = [0u8; 14];
+                chunk.copy_from_slice(&packet[offset + 2..offset + 16]);
+                aaaa_chunks.push((seq, chunk));
+            }
+            _ => return None,
+        }
+
+        offset += rdlen;
     }
-    if out.is_empty() {
-        return None;
+
+    match answer_qtype {
+        Some(RR_TXT) => {
+            if txt_payload.is_empty() {
+                return None;
+            }
+            Some(txt_payload)
+        }
+        Some(RR_AAAA) => {
+            if aaaa_chunks.is_empty() {
+                return None;
+            }
+
+            // Recursive resolvers may reorder RRsets; sort by sequence and validate contiguity.
+            aaaa_chunks.sort_unstable_by_key(|(seq, _)| *seq);
+            for (expected, (seq, _)) in aaaa_chunks.iter().enumerate() {
+                if *seq as usize != expected {
+                    return None;
+                }
+            }
+
+            let mut framed = Vec::with_capacity(aaaa_chunks.len() * 14);
+            for (_, chunk) in &aaaa_chunks {
+                framed.extend_from_slice(chunk);
+            }
+            if framed.len() < 2 {
+                return None;
+            }
+
+            let payload_len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+            if payload_len == 0 {
+                return None;
+            }
+            let end = 2usize.checked_add(payload_len)?;
+            if end > framed.len() {
+                return None;
+            }
+            Some(framed[2..end].to_vec())
+        }
+        _ => None,
     }
-    Some(out)
 }
 
 pub fn is_response(packet: &[u8]) -> bool {
@@ -390,8 +502,45 @@ fn encode_opt_record(out: &mut Vec<u8>) -> Result<(), DnsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_response;
-    use crate::types::{Question, ResponseParams, CLASS_IN, RR_TXT};
+    use super::{decode_response, encode_response};
+    use crate::name::parse_name;
+    use crate::types::{Question, ResponseParams, CLASS_IN, RR_AAAA, RR_TXT};
+    use crate::wire::{parse_header, read_u16};
+
+    fn reorder_answers_reverse(packet: &[u8]) -> Vec<u8> {
+        let header = parse_header(packet).expect("header");
+        let mut offset = header.offset;
+
+        for _ in 0..header.qdcount {
+            let (_, new_offset) = parse_name(packet, offset).expect("question name");
+            offset = new_offset + 4;
+        }
+        let question_end = offset;
+
+        let mut answers = Vec::new();
+        for _ in 0..header.ancount {
+            let rr_start = offset;
+            let (_, name_end) = parse_name(packet, offset).expect("answer name");
+            if name_end + 10 > packet.len() {
+                panic!("truncated answer header");
+            }
+            let rdlen = read_u16(packet, name_end + 8).expect("rdlen") as usize;
+            let rr_end = name_end + 10 + rdlen;
+            if rr_end > packet.len() {
+                panic!("truncated answer rdata");
+            }
+            answers.push(packet[rr_start..rr_end].to_vec());
+            offset = rr_end;
+        }
+
+        let mut out = Vec::with_capacity(packet.len());
+        out.extend_from_slice(&packet[..question_end]);
+        for rr in answers.iter().rev() {
+            out.extend_from_slice(rr);
+        }
+        out.extend_from_slice(&packet[offset..]);
+        out
+    }
 
     #[test]
     fn encode_response_rejects_large_payload() {
@@ -410,5 +559,48 @@ mod tests {
             rcode: None,
         };
         assert!(encode_response(&params).is_err());
+    }
+
+    #[test]
+    fn encode_decode_response_aaaa_roundtrip() {
+        let question = Question {
+            name: "a.test.com.".to_string(),
+            qtype: RR_AAAA,
+            qclass: CLASS_IN,
+        };
+        let payload = vec![0xAB; 73];
+        let params = ResponseParams {
+            id: 0x4321,
+            rd: true,
+            cd: false,
+            question: &question,
+            payload: Some(&payload),
+            rcode: None,
+        };
+        let encoded = encode_response(&params).expect("encode response");
+        let decoded = decode_response(&encoded).expect("decode response");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn decode_response_aaaa_survives_answer_reorder() {
+        let question = Question {
+            name: "a.test.com.".to_string(),
+            qtype: RR_AAAA,
+            qclass: CLASS_IN,
+        };
+        let payload = (0u8..96u8).collect::<Vec<_>>();
+        let params = ResponseParams {
+            id: 0x2222,
+            rd: false,
+            cd: false,
+            question: &question,
+            payload: Some(&payload),
+            rcode: None,
+        };
+        let encoded = encode_response(&params).expect("encode response");
+        let reordered = reorder_answers_reverse(&encoded);
+        let decoded = decode_response(&reordered).expect("decode response");
+        assert_eq!(decoded, payload);
     }
 }

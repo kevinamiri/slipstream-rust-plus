@@ -3,7 +3,9 @@ use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP
 use slipstream_core::{
     net::is_transient_udp_error, normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
-use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
+use slipstream_dns::{
+    encode_response, max_payload_len_for_domain, Question, Rcode, ResponseParams,
+};
 #[cfg(feature = "idle-gc-deferred-delete")]
 use slipstream_ffi::picoquic::picoquic_connection_disconnect;
 use slipstream_ffi::picoquic::{
@@ -40,8 +42,6 @@ const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const DNS_MAX_QUERY_SIZE: usize = 512;
 const IDLE_SLEEP_MS: u64 = 10;
 const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
-// Default QUIC MTU for server packets; see docs/config.md for details.
-const QUIC_MTU: u32 = 900;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
@@ -195,6 +195,13 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         }
         None => None,
     };
+    warn_overlapping_domains(&config.domains);
+    let domains: Vec<&str> = config.domains.iter().map(String::as_str).collect();
+    if domains.is_empty() {
+        return Err(ServerError::new("At least one domain must be configured"));
+    }
+    let quic_mtu = compute_quic_mtu_for_domains(&config.domains)?;
+    tracing::info!("Using DNS QUIC MTU {} bytes", quic_mtu);
 
     let alpn = CString::new(SLIPSTREAM_ALPN)
         .map_err(|_| ServerError::new("ALPN contains an unexpected null byte"))?;
@@ -256,7 +263,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 "Slipstream server congestion algorithm is unavailable",
             ));
         }
-        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, QUIC_MTU);
+        configure_quic_with_custom(quic, slipstream_server_cc_algorithm, quic_mtu);
     }
 
     let udp = Arc::new(bind_udp_socket(&config.dns_listen_host, config.dns_listen_port).await?);
@@ -274,11 +281,6 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     }
     let mut fallback_mgr =
         fallback_addr.map(|addr| FallbackManager::new(udp.clone(), addr, map_ipv4_peers));
-    warn_overlapping_domains(&config.domains);
-    let domains: Vec<&str> = config.domains.iter().map(String::as_str).collect();
-    if domains.is_empty() {
-        return Err(ServerError::new("At least one domain must be configured"));
-    }
 
     unsafe {
         let handler = handle_sigterm as *const () as libc::sighandler_t;
@@ -890,6 +892,27 @@ fn warn_overlapping_domains(domains: &[String]) {
             }
         }
     }
+}
+
+fn compute_quic_mtu_for_domains(domains: &[String]) -> Result<u32, ServerError> {
+    let mut min_payload = usize::MAX;
+    for domain in domains {
+        let payload = max_payload_len_for_domain(domain).map_err(|err| {
+            ServerError::new(format!(
+                "Failed to compute DNS payload limit for '{}': {}",
+                domain, err
+            ))
+        })?;
+        min_payload = min_payload.min(payload);
+    }
+
+    if min_payload == 0 || min_payload == usize::MAX {
+        return Err(ServerError::new(
+            "Computed QUIC MTU is zero; check configured domains",
+        ));
+    }
+
+    u32::try_from(min_payload).map_err(|_| ServerError::new("Computed QUIC MTU is out of range"))
 }
 
 fn is_label_suffix(domain: &str, suffix: &str) -> bool {

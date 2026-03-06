@@ -13,7 +13,7 @@ pub use codec::{
 pub use dots::{dotify, undotify};
 pub use types::{
     DecodeQueryError, DecodedQuery, DnsError, QueryParams, Question, Rcode, ResponseParams,
-    CLASS_IN, EDNS_UDP_PAYLOAD, RR_A, RR_OPT, RR_TXT,
+    CLASS_IN, EDNS_UDP_PAYLOAD, RR_A, RR_AAAA, RR_OPT, RR_TXT,
 };
 
 pub fn build_qname(payload: &[u8], domain: &str) -> Result<String, DnsError> {
@@ -56,7 +56,7 @@ pub fn build_query_with_edns0_payload(
     let params = QueryParams {
         id: query_id,
         qname: &qname,
-        qtype: RR_TXT,
+        qtype: RR_AAAA,
         qclass: CLASS_IN,
         rd: true,
         cd: false,
