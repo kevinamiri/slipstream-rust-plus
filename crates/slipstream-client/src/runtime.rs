@@ -20,7 +20,7 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_AAAA};
+use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_A, RR_AAAA};
 use slipstream_ffi::{
     configure_quic_with_custom,
     picoquic::{
@@ -501,6 +501,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if addr_to.ss_family == 0 {
                     break;
                 }
+                let mut transport_qtype = RR_AAAA;
                 if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
                     let dest = normalize_dual_stack_addr(dest);
                     if let Some(resolver) = find_resolver_by_addr_mut(&mut resolvers, dest) {
@@ -508,36 +509,42 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         resolver.debug.send_packets = resolver.debug.send_packets.saturating_add(1);
                         resolver.debug.send_bytes =
                             resolver.debug.send_bytes.saturating_add(send_length as u64);
+                        transport_qtype = if resolver.mode == ResolverMode::Recursive {
+                            RR_A
+                        } else {
+                            RR_AAAA
+                        };
                     }
                 }
 
                 // Adaptive MTU: Choose encoding based on packet size
                 // Small packets (<= 200 bytes): Use QNAME encoding (resilient mode)
                 // Large packets (> 200 bytes): Use EDNS0 OPT encoding (high-speed mode)
-                let packet = if send_length <= slipstream_dns::EDNS0_THRESHOLD {
-                    // QNAME encoding (legacy/resilient mode)
-                    let qname = build_qname(&send_buf[..send_length], config.domain)
-                        .map_err(|err| ClientError::new(err.to_string()))?;
-                    let params = QueryParams {
-                        id: dns_id,
-                        qname: &qname,
-                        qtype: RR_AAAA,
-                        qclass: CLASS_IN,
-                        rd: true,
-                        cd: false,
-                        qdcount: 1,
-                        is_query: true,
+                let packet =
+                    if transport_qtype == RR_A || send_length <= slipstream_dns::EDNS0_THRESHOLD {
+                        // QNAME encoding (legacy/resilient mode)
+                        let qname = build_qname(&send_buf[..send_length], config.domain)
+                            .map_err(|err| ClientError::new(err.to_string()))?;
+                        let params = QueryParams {
+                            id: dns_id,
+                            qname: &qname,
+                            qtype: transport_qtype,
+                            qclass: CLASS_IN,
+                            rd: true,
+                            cd: false,
+                            qdcount: 1,
+                            is_query: true,
+                        };
+                        encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
+                    } else {
+                        // EDNS0 OPT encoding (high-speed mode)
+                        slipstream_dns::build_query_with_edns0_payload(
+                            &send_buf[..send_length],
+                            config.domain,
+                            dns_id,
+                        )
+                        .map_err(|err| ClientError::new(err.to_string()))?
                     };
-                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
-                } else {
-                    // EDNS0 OPT encoding (high-speed mode)
-                    slipstream_dns::build_query_with_edns0_payload(
-                        &send_buf[..send_length],
-                        config.domain,
-                        dns_id,
-                    )
-                    .map_err(|err| ClientError::new(err.to_string()))?
-                };
                 dns_id = dns_id.wrapping_add(1);
 
                 let dest = sockaddr_storage_to_socket_addr(&addr_to)?;

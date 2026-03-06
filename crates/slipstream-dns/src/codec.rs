@@ -54,20 +54,13 @@ pub fn decode_query_with_domains(
         Err(_) => return Err(DecodeQueryError::Drop),
     };
 
-    if question.qtype != RR_TXT && question.qtype != RR_AAAA {
-        // Recursive resolvers may probe companion A records even when the client asked for AAAA.
-        // Returning NOERROR/NODATA for A avoids negative-cache poisoning on the encoded QNAME.
-        let rcode = if question.qtype == RR_A {
-            Rcode::Ok
-        } else {
-            Rcode::NameError
-        };
+    if question.qtype != RR_TXT && question.qtype != RR_AAAA && question.qtype != RR_A {
         return Err(DecodeQueryError::Reply {
             id: header.id,
             rd,
             cd,
             question: Some(question),
-            rcode,
+            rcode: Rcode::NameError,
         });
     }
 
@@ -264,6 +257,19 @@ pub fn encode_response(params: &ResponseParams<'_>) -> Result<Vec<u8>, DnsError>
     if payload_len > 0 && rcode == Rcode::Ok {
         ancount = match params.question.qtype {
             RR_TXT => 1,
+            RR_A => {
+                let framed_len = payload_len
+                    .checked_add(2)
+                    .ok_or_else(|| DnsError::new("payload too long"))?;
+                // Each A answer has:
+                // - 1 byte sequence index
+                // - 3 bytes payload chunk
+                let answers = framed_len.div_ceil(3);
+                if answers > (u8::MAX as usize + 1) {
+                    return Err(DnsError::new("payload too long"));
+                }
+                answers as u16
+            }
             RR_AAAA => {
                 let framed_len = payload_len
                     .checked_add(2)
@@ -328,6 +334,27 @@ pub fn encode_response(params: &ResponseParams<'_>) -> Result<Vec<u8>, DnsError>
                     remaining -= chunk_len;
                 }
             }
+            RR_A => {
+                if payload_len > u16::MAX as usize {
+                    return Err(DnsError::new("payload too long"));
+                }
+                let mut framed = Vec::with_capacity(payload_len + 2);
+                framed.extend_from_slice(&(payload_len as u16).to_be_bytes());
+                framed.extend_from_slice(payload);
+                for (seq, chunk) in framed.chunks(3).enumerate() {
+                    let seq = u8::try_from(seq).map_err(|_| DnsError::new("too many A chunks"))?;
+                    out.extend_from_slice(&[0xC0, 0x0C]);
+                    write_u16(&mut out, params.question.qtype);
+                    write_u16(&mut out, params.question.qclass);
+                    write_u32(&mut out, 60);
+                    write_u16(&mut out, 4);
+                    out.push(seq);
+                    out.extend_from_slice(chunk);
+                    if chunk.len() < 3 {
+                        out.resize(out.len() + (3 - chunk.len()), 0);
+                    }
+                }
+            }
             RR_AAAA => {
                 if payload_len > u16::MAX as usize {
                     return Err(DnsError::new("payload too long"));
@@ -384,6 +411,7 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
 
     let mut answer_qtype = None;
     let mut txt_payload = Vec::new();
+    let mut a_chunks = Vec::new();
     let mut aaaa_chunks = Vec::new();
 
     for _ in 0..header.ancount {
@@ -428,6 +456,15 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
                     remaining -= txt_len;
                 }
             }
+            RR_A => {
+                if rdlen != 4 {
+                    return None;
+                }
+                let seq = packet[offset];
+                let mut chunk = [0u8; 3];
+                chunk.copy_from_slice(&packet[offset + 1..offset + 4]);
+                a_chunks.push((seq, chunk));
+            }
             RR_AAAA => {
                 if rdlen != 16 {
                     return None;
@@ -449,6 +486,37 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
             Some(txt_payload)
+        }
+        Some(RR_A) => {
+            if a_chunks.is_empty() {
+                return None;
+            }
+
+            // Recursive resolvers may reorder RRsets; sort by sequence and validate contiguity.
+            a_chunks.sort_unstable_by_key(|(seq, _)| *seq);
+            for (expected, (seq, _)) in a_chunks.iter().enumerate() {
+                if *seq as usize != expected {
+                    return None;
+                }
+            }
+
+            let mut framed = Vec::with_capacity(a_chunks.len() * 3);
+            for (_, chunk) in &a_chunks {
+                framed.extend_from_slice(chunk);
+            }
+            if framed.len() < 2 {
+                return None;
+            }
+
+            let payload_len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+            if payload_len == 0 {
+                return None;
+            }
+            let end = 2usize.checked_add(payload_len)?;
+            if end > framed.len() {
+                return None;
+            }
+            Some(framed[2..end].to_vec())
         }
         Some(RR_AAAA) => {
             if aaaa_chunks.is_empty() {
@@ -504,7 +572,7 @@ fn encode_opt_record(out: &mut Vec<u8>) -> Result<(), DnsError> {
 mod tests {
     use super::{decode_response, encode_response};
     use crate::name::parse_name;
-    use crate::types::{Question, ResponseParams, CLASS_IN, RR_AAAA, RR_TXT};
+    use crate::types::{Question, ResponseParams, CLASS_IN, RR_A, RR_AAAA, RR_TXT};
     use crate::wire::{parse_header, read_u16};
 
     fn reorder_answers_reverse(packet: &[u8]) -> Vec<u8> {
@@ -583,6 +651,27 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_response_a_roundtrip() {
+        let question = Question {
+            name: "a.test.com.".to_string(),
+            qtype: RR_A,
+            qclass: CLASS_IN,
+        };
+        let payload = vec![0xCD; 73];
+        let params = ResponseParams {
+            id: 0x1234,
+            rd: true,
+            cd: false,
+            question: &question,
+            payload: Some(&payload),
+            rcode: None,
+        };
+        let encoded = encode_response(&params).expect("encode response");
+        let decoded = decode_response(&encoded).expect("decode response");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
     fn decode_response_aaaa_survives_answer_reorder() {
         let question = Question {
             name: "a.test.com.".to_string(),
@@ -592,6 +681,28 @@ mod tests {
         let payload = (0u8..96u8).collect::<Vec<_>>();
         let params = ResponseParams {
             id: 0x2222,
+            rd: false,
+            cd: false,
+            question: &question,
+            payload: Some(&payload),
+            rcode: None,
+        };
+        let encoded = encode_response(&params).expect("encode response");
+        let reordered = reorder_answers_reverse(&encoded);
+        let decoded = decode_response(&reordered).expect("decode response");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn decode_response_a_survives_answer_reorder() {
+        let question = Question {
+            name: "a.test.com.".to_string(),
+            qtype: RR_A,
+            qclass: CLASS_IN,
+        };
+        let payload = (0u8..96u8).collect::<Vec<_>>();
+        let params = ResponseParams {
+            id: 0x3333,
             rd: false,
             cd: false,
             question: &question,
