@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use slipstream_dns::{decode_response, RR_A, RR_AAAA};
+use slipstream_dns::{decode_response, RR_A, RR_AAAA, RR_TXT};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_incoming_packet_ex, picoquic_quic_t,
     PICOQUIC_PACKET_LOOP_RECV_MAX,
@@ -80,7 +80,7 @@ pub(crate) fn handle_dns_response(
             }
             resolver.last_success_at = current_time;
             resolver.success_rate_ewma = (resolver.success_rate_ewma * 0.8) + 0.2;
-            resolver.recursive_aaaa_failures = 0;
+            resolver.recursive_transport_failures = 0;
             resolver.debug.dns_responses = resolver.debug.dns_responses.saturating_add(1);
             if let Some(response_id) = response_id {
                 if resolver.mode == ResolverMode::Authoritative {
@@ -119,7 +119,11 @@ fn dns_response_meta(packet: &[u8]) -> Option<(u8, u16)> {
 }
 
 fn maybe_fallback_recursive_qtype(resolver: &mut ResolverState, packet: &[u8]) {
-    if resolver.mode != ResolverMode::Recursive || resolver.transport_qtype() != RR_AAAA {
+    if resolver.mode != ResolverMode::Recursive {
+        return;
+    }
+    let current_qtype = resolver.transport_qtype();
+    if current_qtype != RR_AAAA && current_qtype != RR_TXT {
         return;
     }
     let Some((rcode, ancount)) = dns_response_meta(packet) else {
@@ -130,17 +134,34 @@ fn maybe_fallback_recursive_qtype(resolver: &mut ResolverState, packet: &[u8]) {
         return;
     }
     if rcode == 0 {
-        resolver.recursive_aaaa_failures = 0;
+        resolver.recursive_transport_failures = 0;
         return;
     }
-    resolver.recursive_aaaa_failures = resolver.recursive_aaaa_failures.saturating_add(1);
-    if resolver.recursive_aaaa_failures >= RECURSIVE_AAAA_FALLBACK_FAILURES {
-        resolver.set_recursive_transport_qtype(RR_A);
-        resolver.recursive_aaaa_failures = 0;
+    resolver.recursive_transport_failures = resolver.recursive_transport_failures.saturating_add(1);
+    if resolver.recursive_transport_failures >= RECURSIVE_AAAA_FALLBACK_FAILURES {
+        let next_qtype = match current_qtype {
+            RR_AAAA => RR_TXT,
+            RR_TXT => RR_A,
+            _ => return,
+        };
+        resolver.set_recursive_transport_qtype(next_qtype);
+        resolver.recursive_transport_failures = 0;
         warn!(
-            "Resolver {} returned repeated rcode={} for recursive AAAA transport; falling back to A",
-            resolver.addr, rcode
+            "Resolver {} returned repeated rcode={} for recursive {} transport; falling back to {}",
+            resolver.addr,
+            rcode,
+            qtype_name(current_qtype),
+            qtype_name(next_qtype),
         );
+    }
+}
+
+fn qtype_name(qtype: u16) -> &'static str {
+    match qtype {
+        RR_AAAA => "AAAA",
+        RR_TXT => "TXT",
+        RR_A => "A",
+        _ => "UNKNOWN",
     }
 }
 
@@ -154,4 +175,60 @@ fn dns_response_id(packet: &[u8]) -> Option<u16> {
         return None;
     }
     Some(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_fallback_recursive_qtype;
+    use crate::dns::resolve_resolvers_with_bootstrap;
+    use slipstream_core::{AddressFamily, HostPort};
+    use slipstream_dns::{RR_A, RR_AAAA, RR_TXT};
+    use slipstream_ffi::{ResolverMode, ResolverSpec};
+
+    fn recursive_resolver() -> crate::dns::ResolverState {
+        let specs = vec![ResolverSpec {
+            resolver: HostPort {
+                host: "127.0.0.1".to_string(),
+                port: 53,
+                family: AddressFamily::V4,
+            },
+            mode: ResolverMode::Recursive,
+        }];
+        let mut resolved =
+            resolve_resolvers_with_bootstrap(&specs, 1200, false, 0).expect("resolver setup");
+        resolved.remove(0)
+    }
+
+    fn make_response(rcode: u8, ancount: u16) -> [u8; 12] {
+        let mut pkt = [0u8; 12];
+        pkt[2] = 0x80;
+        pkt[3] = rcode & 0x0F;
+        pkt[6..8].copy_from_slice(&ancount.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn recursive_fallback_is_aaaa_then_txt_then_a() {
+        let mut resolver = recursive_resolver();
+        let failure = make_response(2, 0);
+        assert_eq!(resolver.transport_qtype(), RR_AAAA);
+        for _ in 0..3 {
+            maybe_fallback_recursive_qtype(&mut resolver, &failure);
+        }
+        assert_eq!(resolver.transport_qtype(), RR_TXT);
+        for _ in 0..3 {
+            maybe_fallback_recursive_qtype(&mut resolver, &failure);
+        }
+        assert_eq!(resolver.transport_qtype(), RR_A);
+    }
+
+    #[test]
+    fn recursive_empty_noerror_does_not_trigger_fallback() {
+        let mut resolver = recursive_resolver();
+        let empty_ok = make_response(0, 0);
+        for _ in 0..5 {
+            maybe_fallback_recursive_qtype(&mut resolver, &empty_ok);
+        }
+        assert_eq!(resolver.transport_qtype(), RR_AAAA);
+    }
 }

@@ -1,7 +1,7 @@
 use crate::error::ClientError;
 use crate::pacing::{PacingBudgetSnapshot, PacingPollBudget};
 use slipstream_core::{normalize_dual_stack_addr, resolve_host_port};
-use slipstream_dns::{RR_A, RR_AAAA};
+use slipstream_dns::{RR_A, RR_AAAA, RR_TXT};
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode, ResolverSpec};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,7 +42,7 @@ pub(crate) struct ResolverState {
     pub(crate) loss_ewma: f64,
     pub(crate) score_ewma: f64,
     pub(crate) recursive_qtype: u16,
-    pub(crate) recursive_aaaa_failures: u32,
+    pub(crate) recursive_transport_failures: u32,
     pub(crate) pending_polls: usize,
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
@@ -101,20 +101,27 @@ impl ResolverState {
         if self.mode != ResolverMode::Recursive {
             return;
         }
-        if qtype == RR_A || qtype == RR_AAAA {
+        if qtype == RR_A || qtype == RR_AAAA || qtype == RR_TXT {
             self.recursive_qtype = qtype;
         }
     }
 }
 
-pub(crate) fn resolve_resolvers(
+pub(crate) fn resolve_resolvers_with_bootstrap(
     resolvers: &[ResolverSpec],
     mtu: u32,
     debug_poll: bool,
+    bootstrap_index: usize,
 ) -> Result<Vec<ResolverState>, ClientError> {
     let mut resolved = Vec::with_capacity(resolvers.len());
     let mut seen = HashMap::new();
-    for (idx, resolver) in resolvers.iter().enumerate() {
+    if resolvers.is_empty() {
+        return Ok(resolved);
+    }
+    let start = bootstrap_index % resolvers.len();
+    for offset in 0..resolvers.len() {
+        let idx = (start + offset) % resolvers.len();
+        let resolver = &resolvers[idx];
         let addr = resolve_host_port(&resolver.resolver)
             .map_err(|err| ClientError::new(err.to_string()))?;
         let addr = normalize_dual_stack_addr(addr);
@@ -125,7 +132,7 @@ pub(crate) fn resolve_resolvers(
             )));
         }
         seen.insert(addr, resolver.mode);
-        let is_primary = idx == 0;
+        let is_primary = offset == 0;
         resolved.push(ResolverState {
             addr,
             storage: socket_addr_to_storage(addr),
@@ -154,7 +161,7 @@ pub(crate) fn resolve_resolvers(
             loss_ewma: 0.0,
             score_ewma: if is_primary { 1.5 } else { 1.0 },
             recursive_qtype: RR_AAAA,
-            recursive_aaaa_failures: 0,
+            recursive_transport_failures: 0,
             pending_polls: 0,
             inflight_poll_ids: HashMap::new(),
             pacing_budget: match resolver.mode {
@@ -197,7 +204,7 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
     resolver.activated_at = 0;
-    resolver.recursive_aaaa_failures = 0;
+    resolver.recursive_transport_failures = 0;
     resolver.last_probe_reason_code = i32::MIN;
     resolver.last_probe_reason_repeats = 0;
     resolver.state = if disabled {
@@ -215,7 +222,7 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_resolvers;
+    use super::resolve_resolvers_with_bootstrap;
     use slipstream_core::{AddressFamily, HostPort};
     use slipstream_ffi::{ResolverMode, ResolverSpec};
 
@@ -240,9 +247,50 @@ mod tests {
             },
         ];
 
-        match resolve_resolvers(&resolvers, 900, false) {
+        match resolve_resolvers_with_bootstrap(&resolvers, 900, false, 0) {
             Ok(_) => panic!("expected duplicate resolver error"),
             Err(err) => assert!(err.to_string().contains("Duplicate resolver address")),
         }
+    }
+
+    #[test]
+    fn bootstrap_rotation_promotes_selected_resolver() {
+        let resolvers = vec![
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.1".to_string(),
+                    port: 5301,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.1".to_string(),
+                    port: 5302,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.1".to_string(),
+                    port: 5303,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+        ];
+
+        let resolved =
+            resolve_resolvers_with_bootstrap(&resolvers, 900, false, 1).expect("should resolve");
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].addr.port(), 5302);
+        assert!(resolved[0].added);
+        assert_eq!(resolved[0].path_id, 0);
+        assert_eq!(resolved[1].addr.port(), 5303);
+        assert!(!resolved[1].added);
+        assert_eq!(resolved[2].addr.port(), 5301);
+        assert!(!resolved[2].added);
     }
 }

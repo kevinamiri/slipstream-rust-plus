@@ -8,7 +8,7 @@ use self::path::{
 use self::setup::{bind_tcp_listener, bind_udp_socket, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
-    refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
+    refresh_resolver_path, resolve_resolvers_with_bootstrap, resolver_mode_to_c, send_poll_queries,
     sockaddr_storage_to_socket_addr, DnsResponseContext,
 };
 use crate::error::ClientError;
@@ -50,6 +50,7 @@ const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 10_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 1;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
+const BOOTSTRAP_FAILOVER_TIMEOUT_US: u64 = 3_000_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 const PATH_PREPARE_FAILURE_COOLDOWN_US: u64 = 1_000_000;
 const PATH_PREPARE_FAILURE_THRESHOLD: u32 = 3;
@@ -133,11 +134,24 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _state = state;
 
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
+    let mut bootstrap_resolver_index = 0usize;
 
     loop {
-        let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
+        let mut resolvers = resolve_resolvers_with_bootstrap(
+            config.resolvers,
+            mtu,
+            config.debug_poll,
+            bootstrap_resolver_index,
+        )?;
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
+        }
+        if resolvers.len() > 1 && bootstrap_resolver_index % resolvers.len() != 0 {
+            info!(
+                "Bootstrapping with rotated resolver {} (index {} in configured order)",
+                resolvers[0].addr,
+                bootstrap_resolver_index % resolvers.len()
+            );
         }
         let resolver_addr_index: HashMap<std::net::SocketAddr, usize> = resolvers
             .iter()
@@ -253,6 +267,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_with_streams = 0u64;
         let mut last_flow_block_log_at = 0u64;
         let mut current_resolver_index = 0usize;
+        let bootstrap_started_at = current_time;
+        let mut ready_once = false;
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
@@ -265,6 +281,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             let ready = unsafe { (*state_ptr).is_ready() };
             if ready {
+                ready_once = true;
                 unsafe {
                     (*state_ptr).update_acceptor_limit(cnx);
                 }
@@ -278,6 +295,16 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         apply_path_mode(cnx, resolver)?;
                     }
                 }
+            } else if resolvers.len() > 1
+                && current_time.saturating_sub(bootstrap_started_at)
+                    >= BOOTSTRAP_FAILOVER_TIMEOUT_US
+            {
+                warn!(
+                    "Bootstrap timed out after {}ms using resolver {}; forcing reconnect to try the next resolver",
+                    BOOTSTRAP_FAILOVER_TIMEOUT_US / 1000,
+                    resolvers[0].addr
+                );
+                break;
             }
             drain_path_events(cnx, &mut resolvers, state_ptr);
             rebuild_resolver_path_index(&resolvers, &mut resolver_path_index);
@@ -740,6 +767,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let dropped = drain_disconnected_commands(&mut command_rx);
         if dropped > 0 {
             warn!("Dropped {} queued commands while reconnecting", dropped);
+        }
+        if !ready_once && resolvers.len() > 1 {
+            bootstrap_resolver_index = (bootstrap_resolver_index + 1) % resolvers.len();
+            info!(
+                "Will try resolver {} next (bootstrap index {})",
+                resolvers[bootstrap_resolver_index].addr, bootstrap_resolver_index
+            );
         }
         warn!(
             "Connection closed; reconnecting in {}ms",
