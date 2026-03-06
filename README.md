@@ -1,4 +1,20 @@
-# Slipstream Rust Plus
+# Slipstream Rust Plus (AAA)
+
+
+--- new added feature ----
+
+- Added. Recursive transport fallback
+
+`AAAA` -> `TXT` -> `A` (on repeated DNS error rcodes), while keeping empty `NOERROR` poll replies from triggering fallback.
+
+Changes:
+1. Allowed `TXT` as a valid recursive transport qtype in [resolver.rs](/home/slipstream-rust-plus/crates/slipstream-client/src/dns/resolver.rs:100).
+2. fallback logic:
+   - If current recursive qtype is `AAAA` and failures hit threshold, switch to `TXT`.
+   - If current recursive qtype is `TXT` and failures hit threshold, switch to `A`.
+
+
+--- original work ----
 
 Slipstream Rust Plus is a DNS tunnel that carries QUIC traffic over DNS queries and responses.
 
