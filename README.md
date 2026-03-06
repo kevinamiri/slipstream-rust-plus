@@ -14,8 +14,6 @@ Changes:
    - If current recursive qtype is `TXT` and failures hit threshold, switch to `A`.
 
 
---- original work ----
-
 Slipstream Rust Plus is a DNS tunnel that carries QUIC traffic over DNS queries and responses.
 
 ## Build
