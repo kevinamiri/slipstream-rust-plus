@@ -23,9 +23,14 @@ Vector object fields:
 - `response_no_data`: object with `rcode`, `packet_len`, `packet_hex` (or `null` if not applicable)
 - `response_error`: object with `rcode`, `packet_len`, `packet_hex` (optional)
 
+Notes on `non_txt` mode:
+
+- The mode name is legacy.
+- It means "unsupported QTYPE" (currently generated with `NS`), which should trigger `NXDOMAIN` behavior in codec tests.
+
 Regenerate:
 
-```
+```bash
 ./scripts/gen_vectors.sh
 ```
 

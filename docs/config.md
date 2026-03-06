@@ -38,9 +38,15 @@ certificates are not verified.
 - Client ALPN: `picoquic_sample` (must match server ALPN).
 - Client SNI: `test.example.com`.
 - Server ALPN: `picoquic_sample`.
-- Server QUIC MTU: `900`.
-  Update `crates/slipstream-client/src/client.rs` and `crates/slipstream-server/src/server.rs`
-  together to keep client/server ALPN in sync.
+- DNS transport query type selection in runtime:
+  - recursive paths -> `A`
+  - authoritative paths -> `AAAA`
+- EDNS0 payload path is used for large authoritative packets; recursive `A` mode stays in QNAME payload mode.
+- EDNS0 UDP payload advertisement: `1232`.
+- Client QUIC MTU is derived from DNS payload capacity for the configured domain.
+- Server QUIC MTU is computed from configured domains (minimum capacity across them).
+- Update `crates/slipstream-client/src/runtime.rs` and `crates/slipstream-server/src/server.rs`
+  together to keep ALPN/transport assumptions aligned.
 
 ## Server runtime knobs
 

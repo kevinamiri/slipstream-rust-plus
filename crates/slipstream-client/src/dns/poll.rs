@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use slipstream_core::net::is_transient_udp_error;
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_A, RR_AAAA};
+use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_prepare_packet_ex, slipstream_request_poll,
 };
@@ -97,11 +97,7 @@ pub(crate) async fn send_poll_queries(
         let poll_id = *dns_id;
         let qname = build_qname(&send_buf[..send_length], config.domain)
             .map_err(|err| ClientError::new(err.to_string()))?;
-        let qtype = if resolver.mode == ResolverMode::Recursive {
-            RR_A
-        } else {
-            RR_AAAA
-        };
+        let qtype = resolver.transport_qtype();
         let params = QueryParams {
             id: poll_id,
             qname: &qname,

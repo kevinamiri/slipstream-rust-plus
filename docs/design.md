@@ -14,7 +14,7 @@ Rust implementation.
 Crates are organized so core logic and performance-sensitive code are isolated:
 
 - slipstream-core: shared types, parsing, and TCP helpers.
-- slipstream-dns: DNS codec, base32, and dot formatting logic.
+- slipstream-dns: DNS codec, base32 QNAME encoding, and transport RR framing (`TXT`/`A`/`AAAA`).
 - slipstream-ffi: picoquic FFI bindings and runtime helpers.
 - slipstream-client: CLI and client runtime.
 - slipstream-server: CLI and server runtime.
@@ -33,8 +33,9 @@ The DNS codec is intentionally minimal and treats parsing as an attack surface:
 - Strict bounds checks on message length and label lengths.
 - Hard caps on decoded payload sizes.
 - Explicit error handling with drop vs reply behavior.
+- Reorder-safe `A`/`AAAA` response reassembly via explicit sequence indexes.
 
-Golden vectors (fixtures/vectors/dns-vectors.json) are treated as the source of
+Golden vectors (`fixtures/vectors/dns-vectors.json`) are treated as the source of
 truth for DNS behavior.
 
 ## Event loop and concurrency
@@ -52,35 +53,30 @@ Slipstream needs to satisfy two competing cases:
   aborted just because the target is slow.
 - If a second stream appears, a stalled or blackholed stream must not be able to
   exhaust the connection-level window and block new streams. This showed up in
-  practice as “new TCP connections hang” even though the QUIC connection is
+  practice as "new TCP connections hang" even though the QUIC connection is
   still alive.
 
 To cover both:
 
 - In single-stream mode, we rely on TCP-style backpressure (consume after TCP
-  writes) but keep a small reserve window (SLIPSTREAM_CONN_RESERVE_BYTES) so
+  writes) but keep a small reserve window (`SLIPSTREAM_CONN_RESERVE_BYTES`) so
   a new stream can always send its first bytes and trigger mode switch.
 - Once multiple streams are active, we switch to consume-on-receive and enforce
-  per-stream caps (SLIPSTREAM_STREAM_QUEUE_MAX_BYTES). If a stream exceeds its
-  cap, we send STOP_SENDING and discard further data for that stream while
+  per-stream caps (`SLIPSTREAM_STREAM_QUEUE_MAX_BYTES`). If a stream exceeds its
+  cap, we send `STOP_SENDING` and discard further data for that stream while
   continuing to consume, which prevents connection-wide stalls.
 
 ## Rust vs C behavior notes
 
-- The Rust client clamps active DNS polling sleeps to `DNS_POLL_SLICE_US` (50 ms),
-  even if picoquic suggests a longer wake delay. This may differ from the C
-  client's timing and can affect poll cadence under load.
-- Authoritative polling now follows picoquic's pacing rate (bytes/sec) converted
-  to queries per second using the DNS payload size and the current wake delay as
-  an RTT proxy; cwnd remains a fallback if pacing is unavailable. A modest gain
-  is applied when the pacing rate rises to track ProbeBW-like phases without
-  overshooting.
+- Client path mode affects DNS transport type in Rust runtime:
+  - recursive: `A`
+  - authoritative: `AAAA` (and EDNS0 for larger packets)
+- Authoritative polling follows picoquic pacing rate (bytes/sec) converted to
+  queries per second using DNS payload size; cwnd remains a fallback.
 - When QUIC has ready stream data queued, the Rust client suppresses extra polls
   to prioritize data-bearing queries unless flow control blocks progress.
-- When the server has no QUIC payload ready for a poll, the Rust server answers
-  with an empty NOERROR response to clear the poll and avoid backlog, instead
-  of dropping the query; this diverges from the C server, which currently emits
-  NXDOMAIN on an empty payload.
+- When server has no QUIC payload ready for a poll, Rust server returns empty
+  `NOERROR` to clear poll backlog instead of `NXDOMAIN`.
 
 ## Safety and shutdown
 

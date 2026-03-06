@@ -294,6 +294,8 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     };
     let mut recv_buf = vec![0u8; recv_buf_len];
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
+    let mut slots = Vec::new();
+    let mut active_connections = HashMap::new();
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
@@ -312,7 +314,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             }
         }
 
-        let mut slots = Vec::new();
+        slots.clear();
         if let Some(manager) = fallback_mgr.as_mut() {
             manager.cleanup();
         }
@@ -406,7 +408,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         }
 
         let loop_time = unsafe { picoquic_current_time() };
-        let active_connections = collect_active_connections(quic);
+        collect_active_connections_into(quic, &mut active_connections);
 
         for slot in slots.iter_mut() {
             let mut send_length = 0usize;
@@ -660,12 +662,20 @@ fn note_active_connections(last_seen: &mut HashMap<usize, Instant>, slots: &[Slo
 
 fn collect_active_connections(quic: *mut picoquic_quic_t) -> HashMap<usize, *mut picoquic_cnx_t> {
     let mut active = HashMap::new();
+    collect_active_connections_into(quic, &mut active);
+    active
+}
+
+fn collect_active_connections_into(
+    quic: *mut picoquic_quic_t,
+    active: &mut HashMap<usize, *mut picoquic_cnx_t>,
+) {
+    active.clear();
     let mut cnx = unsafe { picoquic_get_first_cnx(quic) };
     while !cnx.is_null() {
         active.insert(cnx as usize, cnx);
         cnx = unsafe { picoquic_get_next_cnx(cnx) };
     }
-    active
 }
 
 fn prune_and_collect_idle<T>(

@@ -1,56 +1,40 @@
 # DNS codec and vectors
 
-This document captures the DNS codec behavior and how it is validated.
+This document describes the current DNS codec behavior and test vectors.
 
-## Canonical behavior (summary)
+## Canonical behavior
 
-- Base32: RFC4648 alphabet, uppercase, no padding on encode; decode is case-insensitive.
-- Inline dots: insert '.' every 57 characters from the right, never add a trailing dot.
-- QNAME format: <base32(payload) with inline dots>.<domain>.
-- Servers may be configured with multiple domains; the QNAME suffix must match one.
-- DNS query: QTYPE=TXT, QCLASS=IN, RD=1, EDNS0 OPT always included.
-- Server decode rules:
-  - QR=1 or QDCOUNT!=1 -> FORMAT_ERROR.
-  - QTYPE!=TXT -> NAME_ERROR.
-  - Empty subdomain or suffix mismatch -> NAME_ERROR.
-  - If multiple suffixes match, use the longest matching domain.
-  - Base32 decode failure -> SERVER_FAILURE.
-  - Parse errors -> drop the message (no response).
-- Client decode rules: accept only QR=1, RCODE=OK, ANCOUNT=1, TXT answer;
-  reassemble multi-part TXT payloads in order.
-- QUIC stateless reset packets, when generated, are carried as normal TXT payloads
-  with RCODE=OK.
+- QNAME payload encoding uses base32 with inline dots.
+- Query decode accepts `TXT`, `A`, and `AAAA` qtypes.
+- Unsupported qtypes are rejected with `NXDOMAIN`.
+- Decoder supports two payload sources:
+  - QNAME subdomain payload
+  - EDNS0 OPT RDATA payload
+- Response encode/decode supports `TXT`, `A`, and `AAAA` payload carriers.
+- `A`/`AAAA` response decoding is reorder-safe via explicit per-chunk sequence indexes.
 
-For the full protocol overview, see docs/protocol.md.
+### Response chunk framing
 
-## Vectors and fixtures
+- `TXT`: raw payload in TXT char-strings.
+- `A`: `[len:u16be][payload]` split into 3-byte chunks; each RR uses `[seq:u8][chunk:3]`.
+- `AAAA`: `[len:u16be][payload]` split into 14-byte chunks; each RR uses `[seq:u16be][chunk:14]`.
 
-Golden vectors live in fixtures/vectors/dns-vectors.json (schema v2).
-Generator input is tools/vector_gen/vectors.txt.
+## Vector fixtures
 
-Regenerate vectors (requires the C repo):
+Golden vectors live in `fixtures/vectors/dns-vectors.json`.
 
-```
+Regenerate vectors:
+
+```bash
 ./scripts/gen_vectors.sh
 ```
 
-Set SLIPSTREAM_DIR if the C repo is not at ../slipstream.
+Set `SLIPSTREAM_DIR` if the C repo is not at `../slipstream`.
 
 ## Tests
 
-Run the codec tests:
-
-```
+```bash
 cargo test -p slipstream-dns
 ```
 
-This validates query/response encoding, error behavior, and raw packet drop cases.
-
-## CLI validation notes
-
-The Rust CLI enforces the following constraints:
-
-- Client requires --domain and at least one --resolver.
-- Resolver parsing supports IPv4, bracketed IPv6, and optional :port.
-- Resolver lists may mix IPv4 and IPv6 entries.
-- Server requires at least one --domain (repeatable); --target-address defaults to 127.0.0.1:5201.
+This suite validates encode/decode behavior, error mapping, and parser drop cases.

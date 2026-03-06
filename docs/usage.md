@@ -23,7 +23,7 @@ Common flags:
 
 Example:
 
-```
+```bash
 ./target/release/slipstream-client \
   --tcp-listen-port 7000 \
   --authoritative 127.0.0.1:8853 \
@@ -40,10 +40,13 @@ Notes:
 - The pinned certificate must match the server leaf exactly; CA bundles are not supported.
 - Resolver order follows the CLI; the first resolver becomes path 0.
 - Resolver addresses must be unique; duplicates are rejected.
-- --authoritative keeps the DNS wire format unchanged and remains C interop safe.
-- Use --authoritative only when you control the resolver/server path and can absorb high QPS bursts.
+- Runtime chooses DNS transport query type by mode:
+  - recursive paths use `A`
+  - authoritative paths use `AAAA`
+- Authoritative paths can use EDNS0 payload mode for large packets; recursive `A` paths stay in QNAME payload mode.
+- Use --authoritative when you control the resolver/server path and can absorb high QPS bursts.
 - When --congestion-control is omitted, authoritative paths default to bbr and recursive paths default to dcubic.
-- Authoritative polling derives its QPS budget from picoquic’s pacing rate (scaled by the DNS payload size and RTT proxy) and falls back to cwnd if pacing is unavailable; `--debug-poll` logs the pacing rate, target QPS, and inflight polls.
+- Authoritative polling derives its QPS budget from picoquic's pacing rate (scaled by DNS payload size and RTT proxy) and falls back to cwnd if pacing is unavailable; `--debug-poll` logs the pacing rate, target QPS, and inflight polls.
 - When QUIC has ready stream data queued, authoritative polling yields to data-bearing queries unless flow control blocks progress.
 - Expect higher CPU usage and detectability risk; misusing it can overload resolvers/servers.
 
@@ -72,7 +75,7 @@ Common flags:
 
 Example:
 
-```
+```bash
 ./target/release/slipstream-server \
   --dns-listen-port 8853 \
   --target-address 127.0.0.1:5201 \
@@ -88,7 +91,7 @@ If the configured cert/key paths are missing, the server auto-generates a
 self-signed ECDSA P-256 certificate (1000-year validity). To generate your
 own manually:
 
-```
+```bash
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout key.pem -out cert.pem -days 365 \
   -subj "/CN=slipstream"
@@ -96,9 +99,9 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 
 ## Local testing
 
-For a local smoke test, the Rust to Rust interop script spins up a UDP proxy and TCP echo:
+For a local smoke test, the Rust-to-Rust interop script spins up a UDP proxy and TCP echo:
 
-```
+```bash
 ./scripts/interop/run_rust_rust.sh
 ```
 

@@ -1,127 +1,93 @@
 # Protocol
 
-Slipstream encapsulates QUIC packets inside DNS TXT queries and responses. The DNS
-codec is intentionally minimal and focused on speed and compatibility.
+Slipstream encapsulates QUIC packets inside DNS traffic. Payloads are carried in QNAME labels or, for some authoritative-path packets, in EDNS0 OPT RDATA.
 
-## Domain suffix
+## Domain suffix matching
 
-- The configured domain is appended to every QNAME as a suffix.
-- The domain is expected without a trailing dot; the implementation appends it.
-- Servers may be configured with multiple domains and must accept any matching suffix.
+- Server is configured with one or more domains.
+- QNAME must end with a configured suffix.
+- If multiple configured domains match, the longest matching suffix is selected.
 
-## Base32 and inline dots
+## QNAME payload encoding
 
-- Base32 alphabet: RFC4648 (A-Z2-7), uppercase, no padding.
-- Encoding: no padding, no hex alphabet.
-- Decoding: case-insensitive and removes all '.' characters before decoding.
-- Inline dot insertion: insert '.' every 57 characters from the right so labels
-  are <= 57 chars.
+- Encoding is base32 RFC4648 (uppercase alphabet, no padding).
+- Decoder is case-insensitive and removes inline dots before decode.
+- Dots are inserted every 57 characters to keep labels within DNS limits.
 
-## DNS query format (client -> server)
+## Query format (client -> server)
 
-- QNAME: <base32(payload) with inline dots>.<domain>.
-- QTYPE: TXT (RR_TXT)
-- QCLASS: IN (CLASS_IN)
-- QDCOUNT: 1
-- ARCOUNT: 1 with EDNS0 OPT record:
-  - name: "."
-  - type: RR_OPT (41)
-  - class: 65535
-  - ttl: 0
-  - udp_payload: 1232
-- RD is set. Other flags default.
-- ID is a 16-bit value (random in C; any 16-bit value is valid for interop).
+- `QDCOUNT = 1`
+- `QCLASS = IN`
+- `RD = 1`
+- `ARCOUNT = 1` with an OPT RR is always emitted by encoder
+- Transport query type is mode-dependent in current client runtime:
+  - Recursive resolver mode: `A`
+  - Authoritative resolver mode: `AAAA`
 
-## DNS response format (server -> client)
+### Payload location
 
-- Mirrors the query ID.
-- QR = 1, OPCODE = QUERY
-- AA = 1
-- RD and CD are copied from the query.
-- QDCOUNT = 1 with the same question as the query.
-- ARCOUNT = 1 with EDNS0 OPT record (same fields as query).
+- QNAME mode:
+  - `QNAME = <base32(payload with inline dots)>.<domain>.`
+- EDNS0 mode (authoritative path, large packet):
+  - `QNAME = <domain>.`
+  - payload bytes are stored in OPT RDATA
 
-### Response payload cases
+## Response format (server -> client)
 
-- If payload length > 0:
-  - RCODE = OK
-  - ANCOUNT = 1
-  - Answer is TXT:
-    - name = query QNAME
-    - type = TXT
-    - class = query class
-    - ttl = 60
-    - text = raw payload bytes (no base32)
-- If payload length == 0 and no error:
-  - RCODE = NAME_ERROR (NXDOMAIN)
-  - ANCOUNT = 0
+- Mirrors query ID.
+- `QR = 1`, `AA = 1`.
+- `RD` and `CD` are copied from query.
+- Same question echoed in Question section.
+- `ARCOUNT = 1` OPT RR.
+- Response RR type follows incoming query type.
 
-## Server-side decode rules
+### Payload framing by RR type
 
-- If the DNS message is not a query (QR=1): respond with FORMAT_ERROR.
-- If QDCOUNT != 1: respond with FORMAT_ERROR.
-- If QTYPE != TXT: respond with NAME_ERROR (ignore query).
-- If the QNAME subdomain is empty: respond with NAME_ERROR.
-- If base32 decode fails: respond with SERVER_FAILURE.
-- If the DNS parser fails (decode error): drop the message (no response).
-- The server must verify that QNAME ends with a configured domain suffix; if not, respond with NAME_ERROR.
-- If multiple suffixes match, the server selects the longest matching suffix.
+If payload is present and `RCODE = NOERROR`:
 
-## Client-side decode rules
+- `TXT`:
+  - one TXT answer RR
+  - payload split across DNS TXT character-strings
+- `A`:
+  - payload is framed as `[len:u16be][payload]`
+  - split into 3-byte chunks
+  - each A RR stores `[seq:u8][chunk:3]` (4 bytes total)
+- `AAAA`:
+  - payload is framed as `[len:u16be][payload]`
+  - split into 14-byte chunks
+  - each AAAA RR stores `[seq:u16be][chunk:14]` (16 bytes total)
 
-The client treats the response as data only when:
+When no payload is available, server runtime may return `NOERROR` with `ANCOUNT=0` to clear polls.
 
-- QR = 1, RCODE = OK, ANCOUNT = 1, and the answer type is TXT.
+## Server decode rules
 
-Otherwise, the response is ignored (including NAME_ERROR, which signals no data).
+- If packet is a response (`QR=1`) or `QDCOUNT != 1`: reply `FORMERR`.
+- If `QTYPE` is not one of `TXT`, `A`, `AAAA`: reply `NXDOMAIN`.
+- If domain/suffix does not match configured domains: reply `NXDOMAIN`.
+- If subdomain payload is empty: reply `NXDOMAIN`.
+- If base32 decode fails: reply `SERVFAIL`.
+- Parse failures may be dropped without reply.
 
-## Segmentation rules
+## Client decode rules
 
-- The client may split a payload into multiple DNS queries when segmentation is used.
-- Each segment is encoded into its own DNS query; segment length is fixed for the batch.
-- The caller must ensure payload_len is a multiple of segment_len if segmentation is used.
-- The server responds with exactly one DNS message per query (no segmentation on server).
+Client accepts payload only when:
 
-## QUIC-specific behavior
+- `QR=1`
+- `RCODE=NOERROR`
+- `ANCOUNT > 0`
+- all answers share one supported type (`TXT`, `A`, or `AAAA`)
 
-- Poll frames are used to request data when the client has no payload to send.
-- Poll frame type is 0x20 (single-byte frame with no payload).
-- Poll frames are only emitted when there is no other frame to send.
-- Poll frames are treated as non-ACK-eliciting but still influence congestion tracking.
-- If the server receives a 1-RTT packet for an unknown connection ID and picoquic has
-  queued a stateless reset for that ID, it returns that QUIC stateless reset payload
-  in the DNS response; otherwise it responds DNS-only.
+For `A` and `AAAA` answers, chunks are sorted by sequence index and contiguity is validated before reassembly.
 
-## Backpressure and buffering
+## Limits and sizing
 
-- Connection-level max_data is set to stream_write_buffer_bytes (default 8 MiB).
-- When only one stream is active, stream data consumption tracks TCP write
-  drain and a small reserve window (SLIPSTREAM_CONN_RESERVE_BYTES) is kept
-  open to allow new streams to send their first bytes.
-- When multiple streams are active, each stream enforces a per-stream receive
-  cap (SLIPSTREAM_STREAM_QUEUE_MAX_BYTES). On overflow, the receiver sends
-  STOP_SENDING, discards data for that stream, and continues consuming to
-  avoid connection-level stalls.
-- Once a connection enters multi-stream mode it stays there for the remainder
-  of the connection.
-
-## Path handling
-
-- The server overwrites the source address with a dummy address before passing to QUIC.
-- Real peer/local addresses are stored per packet and used only for replying.
-- QUIC path validation and migration semantics are effectively disabled at the server.
-
-## Limits and constraints
-
-- MAX_DNS_QUERY_SIZE is 512 bytes (traditional DNS UDP limit).
-- Inline dots ensure label length <= 57 chars.
-- EDNS0 is always included on outbound messages and advertises udp_payload=1232;
-  incoming messages are accepted regardless of OPT presence.
-- Client MTU is derived from the domain length: floor((240 - domain_len) / 1.6).
-- Server MTU is fixed at 900.
+- EDNS UDP payload advertisement: `1232`.
+- Client MTU is derived from `max_payload_len_for_domain(domain)`.
+- Server QUIC MTU is computed as the minimum `max_payload_len_for_domain` across configured domains.
+- EDNS0 payload helper limit: `1232` bytes.
 
 ## References
 
-- DNS codec: crates/slipstream-dns/src/dns.rs
-- Vectors: fixtures/vectors/dns-vectors.json
-- Vector tests: crates/slipstream-dns/tests/vectors.rs
+- DNS codec implementation: `crates/slipstream-dns/src/codec.rs`
+- DNS sizing helpers: `crates/slipstream-dns/src/lib.rs`
+- Vectors: `fixtures/vectors/dns-vectors.json`

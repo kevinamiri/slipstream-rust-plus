@@ -3,18 +3,18 @@
 ## Method
 
 - Build the benchmark binary:
-  cargo build -p slipstream-dns --bin bench_dns --release
+  `cargo build -p slipstream-dns --bin bench_dns --release`
 - Capture runtime stats with time:
-  /usr/bin/time -v ./target/release/bench_dns --iterations=20000 --payload-len=256
+  `/usr/bin/time -v ./target/release/bench_dns --iterations=20000 --payload-len=256`
 - Capture software perf counters:
-  perf stat -e task-clock,context-switches,cpu-migrations,page-faults -- ./target/release/bench_dns --iterations=20000 --payload-len=256
+  `perf stat -e task-clock,context-switches,cpu-migrations,page-faults -- ./target/release/bench_dns --iterations=20000 --payload-len=256`
 
 Hardware counters (cycles/instructions) are not supported on this host, so use
 software counters for now.
 
-## Results (2026-01-03)
+## Results (2026-01-03 baseline)
 
-- Payload clamped to 150 for test.com (base32 + dots + suffix).
+- Payload clamped to 150 for `test.com` (base32 + dots + suffix limits).
 - build_qname: 0.723us/iter, 198 MiB/s
 - encode_query: 0.093us/iter, 2888 MiB/s
 - decode_query: 0.862us/iter, 312 MiB/s
@@ -26,8 +26,9 @@ software counters for now.
 
 ## Notes
 
-- No targeted optimizations applied yet; this is the baseline for future comparisons.
+- Current `bench_dns` still exercises `RR_TXT`; it does not benchmark `A`/`AAAA`
+  reorder-safe response framing paths yet.
 - Re-run with a longer domain or different payload sizes to compare clamping behavior.
 - If perf access is enabled, prefer:
-  perf stat -- ./target/release/bench_dns --iterations=20000 --payload-len=256
+  `perf stat -- ./target/release/bench_dns --iterations=20000 --payload-len=256`
   for CPU counters.

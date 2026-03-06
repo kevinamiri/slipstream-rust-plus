@@ -492,11 +492,18 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
 
-            // Recursive resolvers may reorder RRsets; sort by sequence and validate contiguity.
-            a_chunks.sort_unstable_by_key(|(seq, _)| *seq);
-            for (expected, (seq, _)) in a_chunks.iter().enumerate() {
-                if *seq as usize != expected {
-                    return None;
+            // Fast path for already ordered answers; fallback to sort when recursive
+            // resolvers reorder RRsets.
+            let ordered = a_chunks
+                .iter()
+                .enumerate()
+                .all(|(expected, (seq, _))| *seq as usize == expected);
+            if !ordered {
+                a_chunks.sort_unstable_by_key(|(seq, _)| *seq);
+                for (expected, (seq, _)) in a_chunks.iter().enumerate() {
+                    if *seq as usize != expected {
+                        return None;
+                    }
                 }
             }
 
@@ -523,11 +530,18 @@ pub fn decode_response(packet: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
 
-            // Recursive resolvers may reorder RRsets; sort by sequence and validate contiguity.
-            aaaa_chunks.sort_unstable_by_key(|(seq, _)| *seq);
-            for (expected, (seq, _)) in aaaa_chunks.iter().enumerate() {
-                if *seq as usize != expected {
-                    return None;
+            // Fast path for already ordered answers; fallback to sort when recursive
+            // resolvers reorder RRsets.
+            let ordered = aaaa_chunks
+                .iter()
+                .enumerate()
+                .all(|(expected, (seq, _))| *seq as usize == expected);
+            if !ordered {
+                aaaa_chunks.sort_unstable_by_key(|(seq, _)| *seq);
+                for (expected, (seq, _)) in aaaa_chunks.iter().enumerate() {
+                    if *seq as usize != expected {
+                        return None;
+                    }
                 }
             }
 

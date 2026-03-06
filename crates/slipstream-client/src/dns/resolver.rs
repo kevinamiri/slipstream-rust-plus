@@ -1,6 +1,7 @@
 use crate::error::ClientError;
 use crate::pacing::{PacingBudgetSnapshot, PacingPollBudget};
 use slipstream_core::{normalize_dual_stack_addr, resolve_host_port};
+use slipstream_dns::{RR_A, RR_AAAA};
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode, ResolverSpec};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -40,6 +41,8 @@ pub(crate) struct ResolverState {
     pub(crate) rtt_ewma: f64,
     pub(crate) loss_ewma: f64,
     pub(crate) score_ewma: f64,
+    pub(crate) recursive_qtype: u16,
+    pub(crate) recursive_aaaa_failures: u32,
     pub(crate) pending_polls: usize,
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
@@ -85,6 +88,22 @@ impl ResolverState {
             && !self.retire_pending
             && self.cooldown_until <= now
             && matches!(self.state, ResolverHealthState::Active)
+    }
+
+    pub(crate) fn transport_qtype(&self) -> u16 {
+        match self.mode {
+            ResolverMode::Authoritative => RR_AAAA,
+            ResolverMode::Recursive => self.recursive_qtype,
+        }
+    }
+
+    pub(crate) fn set_recursive_transport_qtype(&mut self, qtype: u16) {
+        if self.mode != ResolverMode::Recursive {
+            return;
+        }
+        if qtype == RR_A || qtype == RR_AAAA {
+            self.recursive_qtype = qtype;
+        }
     }
 }
 
@@ -134,6 +153,8 @@ pub(crate) fn resolve_resolvers(
             rtt_ewma: 100_000.0,
             loss_ewma: 0.0,
             score_ewma: if is_primary { 1.5 } else { 1.0 },
+            recursive_qtype: RR_AAAA,
+            recursive_aaaa_failures: 0,
             pending_polls: 0,
             inflight_poll_ids: HashMap::new(),
             pacing_budget: match resolver.mode {
@@ -176,6 +197,7 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
     resolver.activated_at = 0;
+    resolver.recursive_aaaa_failures = 0;
     resolver.last_probe_reason_code = i32::MIN;
     resolver.last_probe_reason_repeats = 0;
     resolver.state = if disabled {

@@ -2,9 +2,8 @@ mod path;
 mod setup;
 
 use self::path::{
-    apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
-    loop_burst_total, path_poll_burst_max, path_scheduler_weight,
-    retire_underperforming_path_if_needed,
+    apply_path_mode, drain_path_events, fetch_path_quality, loop_burst_total, path_poll_burst_max,
+    path_scheduler_weight, retire_underperforming_path_if_needed,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, map_io};
 use crate::dns::{
@@ -20,7 +19,7 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_A, RR_AAAA};
+use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_AAAA};
 use slipstream_ffi::{
     configure_quic_with_custom,
     picoquic::{
@@ -35,6 +34,7 @@ use slipstream_ffi::{
     },
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
 };
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -139,6 +139,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
         }
+        let resolver_addr_index: HashMap<std::net::SocketAddr, usize> = resolvers
+            .iter()
+            .enumerate()
+            .map(|(idx, resolver)| (resolver.addr, idx))
+            .collect();
+        let mut resolver_path_index = HashMap::with_capacity(resolvers.len());
+        rebuild_resolver_path_index(&resolvers, &mut resolver_path_index);
 
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
@@ -273,6 +280,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
             drain_path_events(cnx, &mut resolvers, state_ptr);
+            rebuild_resolver_path_index(&resolvers, &mut resolver_path_index);
 
             for resolver in resolvers.iter_mut() {
                 if resolver.mode == ResolverMode::Authoritative {
@@ -340,6 +348,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                                 quic,
                                 local_addr_storage: &local_addr_storage,
                                 resolvers: &mut resolvers,
+                                resolver_addr_index: &resolver_addr_index,
+                                resolver_path_index: &resolver_path_index,
                             };
                             handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
                             for _ in 1..packet_loop_recv_max {
@@ -371,7 +381,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             drain_path_events(cnx, &mut resolvers, state_ptr);
+            rebuild_resolver_path_index(&resolvers, &mut resolver_path_index);
 
+            let mut candidate_indices = Vec::with_capacity(resolvers.len());
             for _ in 0..packet_loop_send_max {
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
@@ -395,12 +407,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         (resolver.scheduler_credit + weight).clamp(-4.0, 12.0);
                 }
 
-                let mut candidate_indices: Vec<usize> = (0..resolver_count)
-                    .filter(|idx| {
-                        let resolver = &resolvers[*idx];
-                        resolver.is_schedulable(current_time)
-                    })
-                    .collect();
+                candidate_indices.clear();
+                for idx in 0..resolver_count {
+                    if resolvers[idx].is_schedulable(current_time) {
+                        candidate_indices.push(idx);
+                    }
+                }
                 if candidate_indices.is_empty() {
                     break;
                 }
@@ -416,7 +428,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     })
                 });
 
-                for idx in candidate_indices {
+                for &idx in &candidate_indices {
                     let resolver = &mut resolvers[idx];
                     let ret = unsafe {
                         picoquic_prepare_packet_ex(
@@ -502,49 +514,47 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     break;
                 }
                 let mut transport_qtype = RR_AAAA;
+                let mut recursive_path = false;
                 if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
                     let dest = normalize_dual_stack_addr(dest);
-                    if let Some(resolver) = find_resolver_by_addr_mut(&mut resolvers, dest) {
+                    if let Some(&resolver_index) = resolver_addr_index.get(&dest) {
+                        let resolver = &mut resolvers[resolver_index];
                         resolver.local_addr_storage = Some(unsafe { std::ptr::read(&addr_from) });
                         resolver.debug.send_packets = resolver.debug.send_packets.saturating_add(1);
                         resolver.debug.send_bytes =
                             resolver.debug.send_bytes.saturating_add(send_length as u64);
-                        transport_qtype = if resolver.mode == ResolverMode::Recursive {
-                            RR_A
-                        } else {
-                            RR_AAAA
-                        };
+                        recursive_path = resolver.mode == ResolverMode::Recursive;
+                        transport_qtype = resolver.transport_qtype();
                     }
                 }
 
                 // Adaptive MTU: Choose encoding based on packet size
                 // Small packets (<= 200 bytes): Use QNAME encoding (resilient mode)
                 // Large packets (> 200 bytes): Use EDNS0 OPT encoding (high-speed mode)
-                let packet =
-                    if transport_qtype == RR_A || send_length <= slipstream_dns::EDNS0_THRESHOLD {
-                        // QNAME encoding (legacy/resilient mode)
-                        let qname = build_qname(&send_buf[..send_length], config.domain)
-                            .map_err(|err| ClientError::new(err.to_string()))?;
-                        let params = QueryParams {
-                            id: dns_id,
-                            qname: &qname,
-                            qtype: transport_qtype,
-                            qclass: CLASS_IN,
-                            rd: true,
-                            cd: false,
-                            qdcount: 1,
-                            is_query: true,
-                        };
-                        encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
-                    } else {
-                        // EDNS0 OPT encoding (high-speed mode)
-                        slipstream_dns::build_query_with_edns0_payload(
-                            &send_buf[..send_length],
-                            config.domain,
-                            dns_id,
-                        )
-                        .map_err(|err| ClientError::new(err.to_string()))?
+                let packet = if recursive_path || send_length <= slipstream_dns::EDNS0_THRESHOLD {
+                    // QNAME encoding (legacy/resilient mode)
+                    let qname = build_qname(&send_buf[..send_length], config.domain)
+                        .map_err(|err| ClientError::new(err.to_string()))?;
+                    let params = QueryParams {
+                        id: dns_id,
+                        qname: &qname,
+                        qtype: transport_qtype,
+                        qclass: CLASS_IN,
+                        rd: true,
+                        cd: false,
+                        qdcount: 1,
+                        is_query: true,
                     };
+                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
+                } else {
+                    // EDNS0 OPT encoding (high-speed mode)
+                    slipstream_dns::build_query_with_edns0_payload(
+                        &send_buf[..send_length],
+                        config.domain,
+                        dns_id,
+                    )
+                    .map_err(|err| ClientError::new(err.to_string()))?
+                };
                 dns_id = dns_id.wrapping_add(1);
 
                 let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
@@ -744,5 +754,17 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let _ = drain_disconnected_commands(&mut command_rx);
         }
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_millis(RECONNECT_SLEEP_MAX_MS));
+    }
+}
+
+fn rebuild_resolver_path_index(
+    resolvers: &[crate::dns::ResolverState],
+    path_index: &mut HashMap<libc::c_int, usize>,
+) {
+    path_index.clear();
+    for (idx, resolver) in resolvers.iter().enumerate() {
+        if resolver.added && resolver.path_id >= 0 {
+            path_index.insert(resolver.path_id, idx);
+        }
     }
 }
